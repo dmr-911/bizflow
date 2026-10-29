@@ -1,4 +1,4 @@
-import type { DB } from "../db";
+import type { TenantDb } from "../db";
 import { daysBetween, lastMonths, todayIso } from "../dates";
 import type { Currency } from "../money";
 
@@ -22,43 +22,46 @@ export interface DashboardStats {
   paidThisMonth: ByCurrency;
 }
 
-export function dashboardStats(db: DB, today = todayIso()): DashboardStats {
-  const counts = db
-    .prepare(
+export async function dashboardStats(db: TenantDb, today = todayIso()): Promise<DashboardStats> {
+  type Sum = { currency: Currency; amount: number };
+  const [counts, paid, paidThisMonth, outstanding, overdue] = await Promise.all([
+    db.get<Omit<DashboardStats, "paid" | "outstanding" | "overdue" | "paidThisMonth">>(
       `SELECT
-         SUM(kind = 'invoice' AND status != 'cancelled') AS invoiceCount,
-         SUM(kind = 'quotation') AS quotationCount,
-         SUM(kind = 'quotation' AND status IN ('draft','sent','accepted')) AS openQuotationCount,
-         SUM(kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < @today) AS overdueCount
-       FROM documents`,
-    )
-    .get({ today }) as Record<string, number | null>;
-  const paid = db
-    .prepare(`SELECT d.currency, SUM(p.amount) AS amount FROM payments p JOIN documents d ON d.id = p.invoice_id GROUP BY d.currency`)
-    .all() as { currency: Currency; amount: number }[];
-  const paidThisMonth = db
-    .prepare(
-      `SELECT d.currency, SUM(p.amount) AS amount FROM payments p JOIN documents d ON d.id = p.invoice_id
-       WHERE substr(p.paid_at, 1, 7) = ? GROUP BY d.currency`,
-    )
-    .all(today.slice(0, 7)) as { currency: Currency; amount: number }[];
-  const outstanding = db
-    .prepare(
+         COUNT(*) FILTER (WHERE kind = 'invoice' AND status != 'cancelled') AS "invoiceCount",
+         COUNT(*) FILTER (WHERE kind = 'quotation') AS "quotationCount",
+         COUNT(*) FILTER (WHERE kind = 'quotation' AND status IN ('draft','sent','accepted')) AS "openQuotationCount",
+         COUNT(*) FILTER (WHERE kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < $2) AS "overdueCount"
+       FROM documents WHERE account_id = $1`,
+      db.accountId,
+      today,
+    ),
+    db.all<Sum>(
+      `SELECT d.currency, SUM(p.amount) AS amount FROM payments p
+       JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
+       WHERE p.account_id = $1 GROUP BY d.currency`,
+      db.accountId,
+    ),
+    db.all<Sum>(
+      `SELECT d.currency, SUM(p.amount) AS amount FROM payments p
+       JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
+       WHERE p.account_id = $1 AND substr(p.paid_at, 1, 7) = $2 GROUP BY d.currency`,
+      db.accountId,
+      today.slice(0, 7),
+    ),
+    db.all<Sum>(
       `SELECT currency, SUM(total - amount_paid) AS amount FROM documents
-       WHERE kind = 'invoice' AND status IN ('sent','partially_paid') GROUP BY currency`,
-    )
-    .all() as { currency: Currency; amount: number }[];
-  const overdue = db
-    .prepare(
+       WHERE account_id = $1 AND kind = 'invoice' AND status IN ('sent','partially_paid') GROUP BY currency`,
+      db.accountId,
+    ),
+    db.all<Sum>(
       `SELECT currency, SUM(total - amount_paid) AS amount FROM documents
-       WHERE kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < ? GROUP BY currency`,
-    )
-    .all(today) as { currency: Currency; amount: number }[];
+       WHERE account_id = $1 AND kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < $2 GROUP BY currency`,
+      db.accountId,
+      today,
+    ),
+  ]);
   return {
-    invoiceCount: counts.invoiceCount ?? 0,
-    quotationCount: counts.quotationCount ?? 0,
-    openQuotationCount: counts.openQuotationCount ?? 0,
-    overdueCount: counts.overdueCount ?? 0,
+    ...counts!,
     paid: group(paid),
     outstanding: group(outstanding),
     overdue: group(overdue),
@@ -78,24 +81,28 @@ export interface MonthRow {
  * "invoiced" is accrual basis (issued, non-cancelled invoices by issue date).
  * Months with no activity are included as zero so charts have no gaps.
  */
-export function revenueByMonth(db: DB, opts: { months?: number; currency: Currency; today?: string }): MonthRow[] {
+export async function revenueByMonth(db: TenantDb, opts: { months?: number; currency: Currency; today?: string }): Promise<MonthRow[]> {
   const today = opts.today ?? todayIso();
   const months = lastMonths(today, opts.months ?? 12);
   const from = `${months[0]}-01`;
-  const received = db
-    .prepare(
+  const [received, invoiced] = await Promise.all([
+    db.all<{ month: string; amount: number }>(
       `SELECT substr(p.paid_at, 1, 7) AS month, SUM(p.amount) AS amount
-       FROM payments p JOIN documents d ON d.id = p.invoice_id
-       WHERE d.currency = ? AND p.paid_at >= ? GROUP BY month`,
-    )
-    .all(opts.currency, from) as { month: string; amount: number }[];
-  const invoiced = db
-    .prepare(
+       FROM payments p JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
+       WHERE p.account_id = $1 AND d.currency = $2 AND p.paid_at >= $3 GROUP BY month`,
+      db.accountId,
+      opts.currency,
+      from,
+    ),
+    db.all<{ month: string; amount: number }>(
       `SELECT substr(issue_date, 1, 7) AS month, SUM(total) AS amount FROM documents
-       WHERE kind = 'invoice' AND status NOT IN ('draft','cancelled') AND currency = ? AND issue_date >= ?
+       WHERE account_id = $1 AND kind = 'invoice' AND status NOT IN ('draft','cancelled') AND currency = $2 AND issue_date >= $3
        GROUP BY month`,
-    )
-    .all(opts.currency, from) as { month: string; amount: number }[];
+      db.accountId,
+      opts.currency,
+      from,
+    ),
+  ]);
   const r = new Map(received.map((x) => [x.month, x.amount]));
   const i = new Map(invoiced.map((x) => [x.month, x.amount]));
   return months.map((month) => ({ month, currency: opts.currency, invoiced: i.get(month) ?? 0, received: r.get(month) ?? 0 }));
@@ -115,15 +122,14 @@ export interface OutstandingRow {
 }
 
 /** Outstanding balances per customer with simple aging buckets by days past due. */
-export function outstandingBalances(db: DB, today = todayIso()): OutstandingRow[] {
-  const rows = db
-    .prepare(
-      `SELECT d.customer_id AS customerId, c.name AS customerName, d.currency, d.due_date AS dueDate,
-              d.issue_date AS issueDate, d.total - d.amount_paid AS balance
-       FROM documents d JOIN customers c ON c.id = d.customer_id
-       WHERE d.kind = 'invoice' AND d.status IN ('sent','partially_paid') AND d.total > d.amount_paid`,
-    )
-    .all() as { customerId: number; customerName: string; currency: Currency; dueDate: string | null; issueDate: string; balance: number }[];
+export async function outstandingBalances(db: TenantDb, today = todayIso()): Promise<OutstandingRow[]> {
+  const rows = await db.all<{ customerId: number; customerName: string; currency: Currency; dueDate: string | null; issueDate: string; balance: number }>(
+    `SELECT d.customer_id AS "customerId", c.name AS "customerName", d.currency, d.due_date AS "dueDate",
+            d.issue_date AS "issueDate", d.total - d.amount_paid AS balance
+     FROM documents d JOIN customers c ON c.account_id = d.account_id AND c.id = d.customer_id
+     WHERE d.account_id = $1 AND d.kind = 'invoice' AND d.status IN ('sent','partially_paid') AND d.total > d.amount_paid`,
+    db.accountId,
+  );
   const map = new Map<string, OutstandingRow>();
   for (const r of rows) {
     const key = `${r.customerId}|${r.currency}`;
@@ -155,23 +161,26 @@ export interface ActiveCustomerRow {
 }
 
 /** Customers ranked by how much business happened with them in the period. */
-export function mostActiveCustomers(db: DB, opts: { since: string; limit?: number }): ActiveCustomerRow[] {
-  const rows = db
-    .prepare(
-      `SELECT c.id AS customerId, c.name AS customerName, c.company,
-         (SELECT COUNT(*) FROM documents d WHERE d.customer_id = c.id AND d.issue_date >= @since) AS documents,
-         (SELECT COUNT(*) FROM payments p JOIN documents d ON d.id = p.invoice_id
-            WHERE d.customer_id = c.id AND p.paid_at >= @since) AS payments,
-         (SELECT MAX(created_at) FROM activities a WHERE a.customer_id = c.id) AS lastActivity
-       FROM customers c`,
-    )
-    .all({ since: opts.since }) as Omit<ActiveCustomerRow, "received" | "activityCount">[];
-  const receivedRows = db
-    .prepare(
-      `SELECT d.customer_id AS customerId, d.currency, SUM(p.amount) AS amount
-       FROM payments p JOIN documents d ON d.id = p.invoice_id WHERE p.paid_at >= ? GROUP BY d.customer_id, d.currency`,
-    )
-    .all(opts.since) as { customerId: number; currency: Currency; amount: number }[];
+export async function mostActiveCustomers(db: TenantDb, opts: { since: string; limit?: number }): Promise<ActiveCustomerRow[]> {
+  const [rows, receivedRows] = await Promise.all([
+    db.all<Omit<ActiveCustomerRow, "received" | "activityCount">>(
+      `SELECT c.id AS "customerId", c.name AS "customerName", c.company,
+         (SELECT COUNT(*) FROM documents d WHERE d.account_id = c.account_id AND d.customer_id = c.id AND d.issue_date >= $2) AS documents,
+         (SELECT COUNT(*) FROM payments p JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
+            WHERE p.account_id = c.account_id AND d.customer_id = c.id AND p.paid_at >= $2) AS payments,
+         (SELECT MAX(created_at) FROM activities a WHERE a.account_id = c.account_id AND a.customer_id = c.id) AS "lastActivity"
+       FROM customers c WHERE c.account_id = $1`,
+      db.accountId,
+      opts.since,
+    ),
+    db.all<{ customerId: number; currency: Currency; amount: number }>(
+      `SELECT d.customer_id AS "customerId", d.currency, SUM(p.amount) AS amount
+       FROM payments p JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
+       WHERE p.account_id = $1 AND p.paid_at >= $2 GROUP BY d.customer_id, d.currency`,
+      db.accountId,
+      opts.since,
+    ),
+  ]);
   return rows
     .map((r) => ({
       ...r,

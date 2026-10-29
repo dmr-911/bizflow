@@ -3,7 +3,7 @@ import { openStripePortalAction, startBkashPaymentAction, startStripeCheckoutAct
 import { DeleteAccountForm } from "@/components/delete-account-form";
 import { Icon } from "@/components/icons";
 import { Alert, Badge, Button, Card, PageHeader, Table, Td, Th } from "@/components/ui";
-import { getControlDb } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { bkashConfig } from "@/lib/billing/bkash";
 import { stripeClient } from "@/lib/billing/stripe";
 import { applySubscription } from "@/lib/billing/stripe-events";
@@ -23,9 +23,9 @@ async function syncCheckout(accountId: number, sessionId: string): Promise<boole
   try {
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["subscription"] });
     if (session.client_reference_id !== String(accountId) || session.status !== "complete") return false;
-    const db = getControlDb();
-    if (typeof session.customer === "string") setStripeCustomer(db, accountId, session.customer);
-    if (session.subscription && typeof session.subscription !== "string") applySubscription(db, session.subscription, accountId);
+    const db = await getDb();
+    if (typeof session.customer === "string") await setStripeCustomer(db, accountId, session.customer);
+    if (session.subscription && typeof session.subscription !== "string") await applySubscription(db, session.subscription, accountId);
     return true;
   } catch (e) {
     console.error("Could not confirm Stripe checkout", sessionId, e);
@@ -73,11 +73,10 @@ export default async function BillingPage({ searchParams }: { searchParams: Prom
   const { user, t, fmt } = await accountContext();
   const sp = await searchParams;
   const confirmed = sp.checkout === "success" && sp.session_id ? await syncCheckout(user.accountId, sp.session_id) : false;
-  const db = getControlDb();
+  const db = await getDb();
   // Read after a possible sync so the page shows the new state.
-  const sub = getSubscription(db, user.accountId);
+  const [sub, payments] = await Promise.all([getSubscription(db, user.accountId), listBillingPayments(db, user.accountId)]);
   const access = accessState(sub);
-  const payments = listBillingPayments(db, user.accountId);
   const b = t.billing;
   const msg = notice(sp, b, confirmed);
   const stripeOn = !!stripeClient();

@@ -11,7 +11,7 @@ export async function saveCustomerAction(id: number | null, input: CustomerFormV
   const { db } = await requireAccess();
   let savedId: number;
   try {
-    savedId = id ? updateCustomer(db, id, input as never).id : createCustomer(db, input as never).id;
+    savedId = id ? (await updateCustomer(db, id, input as never)).id : (await createCustomer(db, input as never)).id;
   } catch (e) {
     return toActionError(e);
   }
@@ -22,7 +22,7 @@ export async function saveCustomerAction(id: number | null, input: CustomerFormV
 export async function archiveCustomerAction(form: FormData) {
   const { db } = await requireAccess();
   const id = Number(form.get("id"));
-  setCustomerArchived(db, id, form.get("archive") === "1");
+  await setCustomerArchived(db, id, form.get("archive") === "1");
   revalidatePath("/customers");
   revalidatePath(`/customers/${id}`);
 }

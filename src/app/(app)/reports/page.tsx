@@ -13,10 +13,12 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
   const { db, t, fmt, settings } = await pageContext();
   const sp = await searchParams;
   const currency: Currency = CURRENCIES.includes(sp.currency as Currency) ? (sp.currency as Currency) : settings.defaultCurrency;
-  const months = revenueByMonth(db, { months: 12, currency });
+  const [months, outstanding, active] = await Promise.all([
+    revenueByMonth(db, { months: 12, currency }),
+    outstandingBalances(db),
+    mostActiveCustomers(db, { since: addMonths(todayIso(), -12), limit: 10 }),
+  ]);
   const totals = months.reduce((a, r) => ({ invoiced: a.invoiced + r.invoiced, received: a.received + r.received }), { invoiced: 0, received: 0 });
-  const outstanding = outstandingBalances(db);
-  const active = mostActiveCustomers(db, { since: addMonths(todayIso(), -12), limit: 10 });
   const money = (v: number, c: Currency = currency) => (v ? fmt.money(v, c) : "—");
 
   const exports = [

@@ -1,15 +1,5 @@
-/**
- * Migrations for the control database: accounts, logins, sessions and billing.
- * Business records never live here; each account has its own database file
- * (see MIGRATIONS in ./migrations). Append new migrations; never edit one that has shipped.
- *
- * Money columns are INTEGER minor units (cents / poisha), timestamps TEXT ISO-8601 UTC.
- */
-export const CONTROL_MIGRATIONS: { id: number; name: string; sql: string }[] = [
-  {
-    id: 1,
-    name: "accounts, users and billing",
-    sql: `
+-- Schema of control.db as created by the SQLite version (before the move to Postgres).
+-- Used by tests/sqlite-import.test.ts.
 CREATE TABLE accounts (
   id            INTEGER PRIMARY KEY,
   business_name TEXT NOT NULL,
@@ -82,6 +72,3 @@ CREATE TABLE webhook_events (
   received_at TEXT NOT NULL,
   PRIMARY KEY (provider, event_id)
 );
-`,
-  },
-];

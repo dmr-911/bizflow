@@ -1,4 +1,4 @@
-import type { DB } from "../db";
+import type { TenantDb } from "../db";
 import { nowIso } from "../db";
 import { todayIso } from "../dates";
 import { TransitionError } from "../status";
@@ -33,100 +33,112 @@ export function followUpDisplayStatus(f: { status: FollowUpStatus; dueDate: stri
 }
 
 const SELECT = `
-  SELECT f.id, f.title, f.note, f.due_date AS dueDate, f.status, f.customer_id AS customerId, c.name AS customerName,
-         f.document_id AS documentId, d.number AS documentNumber, d.kind AS documentKind,
-         f.completed_at AS completedAt, f.created_at AS createdAt
+  SELECT f.id, f.title, f.note, f.due_date AS "dueDate", f.status, f.customer_id AS "customerId", c.name AS "customerName",
+         f.document_id AS "documentId", d.number AS "documentNumber", d.kind AS "documentKind",
+         f.completed_at AS "completedAt", f.created_at AS "createdAt"
   FROM follow_ups f
-  LEFT JOIN customers c ON c.id = f.customer_id
-  LEFT JOIN documents d ON d.id = f.document_id`;
+  LEFT JOIN customers c ON c.account_id = f.account_id AND c.id = f.customer_id
+  LEFT JOIN documents d ON d.account_id = f.account_id AND d.id = f.document_id`;
 
 type Row = Omit<FollowUp, "displayStatus">;
 
-export function listFollowUps(
-  db: DB,
+export async function listFollowUps(
+  db: TenantDb,
   opts: { filter?: "all" | "pending" | "completed" | "overdue"; customerId?: number; limit?: number } = {},
   today = todayIso(),
-): FollowUp[] {
-  const where: string[] = [];
-  const params: Record<string, unknown> = { today };
-  if (opts.customerId) {
-    where.push("f.customer_id = @customerId");
-    params.customerId = opts.customerId;
-  }
+): Promise<FollowUp[]> {
+  const where = ["f.account_id = $1"];
+  const params: unknown[] = [db.accountId];
+  const param = (v: unknown) => `$${params.push(v)}`;
+  if (opts.customerId) where.push(`f.customer_id = ${param(opts.customerId)}`);
   switch (opts.filter) {
     case "pending":
-      where.push("f.status = 'pending' AND f.due_date >= @today");
+      where.push(`f.status = 'pending' AND f.due_date >= ${param(today)}`);
       break;
     case "overdue":
-      where.push("f.status = 'pending' AND f.due_date < @today");
+      where.push(`f.status = 'pending' AND f.due_date < ${param(today)}`);
       break;
     case "completed":
       where.push("f.status = 'completed'");
       break;
   }
-  const order = opts.filter === "completed" ? "f.completed_at DESC" : "f.status DESC, f.due_date ASC, f.id ASC";
-  const sql = `${SELECT} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${order} ${opts.limit ? "LIMIT " + Number(opts.limit) : ""}`;
-  return (db.prepare(sql).all(params) as Row[]).map((r) => ({ ...r, displayStatus: followUpDisplayStatus(r, today) }));
+  const order = opts.filter === "completed" ? "f.completed_at DESC NULLS LAST" : "f.status DESC, f.due_date ASC, f.id ASC";
+  const sql = `${SELECT} WHERE ${where.join(" AND ")} ORDER BY ${order} ${opts.limit ? "LIMIT " + Number(opts.limit) : ""}`;
+  return (await db.all<Row>(sql, ...params)).map((r) => ({ ...r, displayStatus: followUpDisplayStatus(r, today) }));
 }
 
 /** Pending items due within `days` days, including everything overdue. */
-export function upcomingFollowUps(db: DB, days = 7, today = todayIso()): FollowUp[] {
+export async function upcomingFollowUps(db: TenantDb, days = 7, today = todayIso()): Promise<FollowUp[]> {
   const until = new Date(`${today}T00:00:00Z`);
   until.setUTCDate(until.getUTCDate() + days);
-  return (
-    db
-      .prepare(`${SELECT} WHERE f.status = 'pending' AND f.due_date <= ? ORDER BY f.due_date ASC, f.id ASC`)
-      .all(until.toISOString().slice(0, 10)) as Row[]
-  ).map((r) => ({ ...r, displayStatus: followUpDisplayStatus(r, today) }));
+  const rows = await db.all<Row>(
+    `${SELECT} WHERE f.account_id = $1 AND f.status = 'pending' AND f.due_date <= $2 ORDER BY f.due_date ASC, f.id ASC`,
+    db.accountId,
+    until.toISOString().slice(0, 10),
+  );
+  return rows.map((r) => ({ ...r, displayStatus: followUpDisplayStatus(r, today) }));
 }
 
-export function reminderCounts(db: DB, today = todayIso()): { overdue: number; dueToday: number } {
-  const r = db
-    .prepare(
-      `SELECT SUM(CASE WHEN due_date < @today THEN 1 ELSE 0 END) AS overdue,
-              SUM(CASE WHEN due_date = @today THEN 1 ELSE 0 END) AS dueToday
-       FROM follow_ups WHERE status = 'pending'`,
-    )
-    .get({ today }) as { overdue: number | null; dueToday: number | null };
-  return { overdue: r.overdue ?? 0, dueToday: r.dueToday ?? 0 };
+export async function reminderCounts(db: TenantDb, today = todayIso()): Promise<{ overdue: number; dueToday: number }> {
+  const r = (await db.get<{ overdue: number; dueToday: number }>(
+    `SELECT COUNT(*) FILTER (WHERE due_date < $2) AS overdue, COUNT(*) FILTER (WHERE due_date = $2) AS "dueToday"
+     FROM follow_ups WHERE account_id = $1 AND status = 'pending'`,
+    db.accountId,
+    today,
+  ))!;
+  return { overdue: r.overdue, dueToday: r.dueToday };
 }
 
-export function createFollowUp(db: DB, raw: unknown): number {
+export async function createFollowUp(db: TenantDb, raw: unknown): Promise<number> {
   const f = followUpSchema.parse(raw);
-  return db.transaction(() => {
+  return db.tx(async (db) => {
     let customerId = f.customerId;
     if (f.documentId) {
-      const doc = db.prepare("SELECT customer_id AS customerId FROM documents WHERE id = ?").get(f.documentId) as
-        | { customerId: number }
-        | undefined;
+      const doc = await db.get<{ customerId: number }>(
+        `SELECT customer_id AS "customerId" FROM documents WHERE account_id = $1 AND id = $2`,
+        db.accountId,
+        f.documentId,
+      );
       if (!doc) throw new NotFoundError("Document");
       customerId = customerId ?? doc.customerId;
       if (customerId !== doc.customerId) throw new TransitionError("Document belongs to a different customer");
     }
-    if (customerId && !getCustomer(db, customerId)) throw new NotFoundError("Customer");
-    const res = db
-      .prepare(
-        `INSERT INTO follow_ups (title, note, due_date, customer_id, document_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(f.title, f.note, f.dueDate, customerId, f.documentId, nowIso());
-    logActivity(db, { type: "followup.created", message: `Follow-up scheduled: ${f.title} (${f.dueDate})`, customerId, documentId: f.documentId });
-    return Number(res.lastInsertRowid);
-  })();
+    if (customerId && !(await getCustomer(db, customerId))) throw new NotFoundError("Customer");
+    const { id } = (await db.get<{ id: number }>(
+      `INSERT INTO follow_ups (account_id, title, note, due_date, customer_id, document_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      db.accountId,
+      f.title,
+      f.note,
+      f.dueDate,
+      customerId,
+      f.documentId,
+      nowIso(),
+    ))!;
+    await logActivity(db, { type: "followup.created", message: `Follow-up scheduled: ${f.title} (${f.dueDate})`, customerId, documentId: f.documentId });
+    return id;
+  });
 }
 
-export function setFollowUpCompleted(db: DB, id: number, completed: boolean): void {
-  const f = db.prepare("SELECT title, customer_id AS customerId FROM follow_ups WHERE id = ?").get(id) as
-    | { title: string; customerId: number | null }
-    | undefined;
-  if (!f) throw new NotFoundError("Follow-up");
-  db.prepare("UPDATE follow_ups SET status = ?, completed_at = ? WHERE id = ?").run(
-    completed ? "completed" : "pending",
-    completed ? nowIso() : null,
-    id,
-  );
-  if (completed) logActivity(db, { type: "followup.completed", message: `Follow-up done: ${f.title}`, customerId: f.customerId });
+export async function setFollowUpCompleted(db: TenantDb, id: number, completed: boolean): Promise<void> {
+  await db.tx(async (db) => {
+    const f = await db.get<{ title: string; customerId: number | null }>(
+      `SELECT title, customer_id AS "customerId" FROM follow_ups WHERE account_id = $1 AND id = $2`,
+      db.accountId,
+      id,
+    );
+    if (!f) throw new NotFoundError("Follow-up");
+    await db.run(
+      "UPDATE follow_ups SET status = $3, completed_at = $4 WHERE account_id = $1 AND id = $2",
+      db.accountId,
+      id,
+      completed ? "completed" : "pending",
+      completed ? nowIso() : null,
+    );
+    if (completed) await logActivity(db, { type: "followup.completed", message: `Follow-up done: ${f.title}`, customerId: f.customerId });
+  });
 }
 
-export function deleteFollowUp(db: DB, id: number): void {
-  db.prepare("DELETE FROM follow_ups WHERE id = ?").run(id);
+export async function deleteFollowUp(db: TenantDb, id: number): Promise<void> {
+  await db.run("DELETE FROM follow_ups WHERE account_id = $1 AND id = $2", db.accountId, id);
 }

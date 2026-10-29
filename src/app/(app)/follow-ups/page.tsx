@@ -13,8 +13,12 @@ export default async function FollowUpsPage({ searchParams }: { searchParams: Pr
   const { db, t, fmt } = await pageContext();
   const raw = (await searchParams).filter;
   const filter = (FILTERS as readonly string[]).includes(raw ?? "") ? (raw as (typeof FILTERS)[number]) : "all";
-  const items = listFollowUps(db, { filter });
-  const counts = Object.fromEntries(FILTERS.map((f) => [f, listFollowUps(db, { filter: f }).length]));
+  const [items, customers, ...perFilter] = await Promise.all([
+    listFollowUps(db, { filter }),
+    customerOptions(db),
+    ...FILTERS.map((f) => listFollowUps(db, { filter: f })),
+  ]);
+  const counts = Object.fromEntries(FILTERS.map((f, i) => [f, perFilter[i].length]));
   const labels = { all: t.common.all, pending: t.status.pending, overdue: t.status.overdue, completed: t.status.completed };
 
   return (
@@ -28,7 +32,7 @@ export default async function FollowUpsPage({ searchParams }: { searchParams: Pr
           {items.length === 0 ? <EmptyState icon="⏰" title={t.followUps.empty} text={t.followUps.emptyText} /> : <FollowUpList items={items} t={t} fmt={fmt} showCustomer />}
         </Card>
         <Card>
-          <FollowUpForm customers={customerOptions(db)} defaultDate={todayIso()} />
+          <FollowUpForm customers={customers} defaultDate={todayIso()} />
         </Card>
       </div>
     </>
