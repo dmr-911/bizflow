@@ -1,0 +1,44 @@
+{
+  "name": "bizflow-kit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BizFlow Kit - self-hosted digital operations for freelancers and small businesses",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx scripts/db.ts migrate",
+    "db:seed": "tsx scripts/db.ts seed",
+    "db:reset": "tsx scripts/db.ts reset",
+    "db:backup": "tsx scripts/db.ts backup",
+    "set-password": "tsx scripts/db.ts set-password"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.20.5",
+    "@types/react": "19.1",
+    "@types/react-dom": "19.1",
+    "tailwindcss": "4.1",
+    "tsx": "^4.23.15",
+    "typescript": "5.9",
+    "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^5.9.2",
+    "better-sqlite3": "^13.0.3",
+    "next": "^15.5.28",
+    "react": "^19.1.10",
+    "react-dom": "^19.1.10",
+    "react-hook-form": "^7.91.0",
+    "zod": "^4.6.7"
+  }
+}
