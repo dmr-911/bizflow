@@ -10,7 +10,7 @@ import { pageContext } from "@/lib/server/context";
 
 export const metadata = { title: "Dashboard" };
 
-export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ demo?: string }> }) {
+export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ demo?: string; welcome?: string }> }) {
   const { db, settings, t, fmt } = await pageContext();
   const sp = await searchParams;
   const stats = dashboardStats(db);
@@ -41,6 +41,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
       />
 
       <div className="space-y-6">
+        {sp.welcome && <Alert tone="success">{t.dashboard.welcomeNew}</Alert>}
         {sp.demo && <Alert tone="success">{t.settings.demoLoaded}</Alert>}
         {reminders.overdue + reminders.dueToday > 0 && (
           <Alert tone="warning">

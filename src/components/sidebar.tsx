@@ -10,14 +10,15 @@ import { Icon, type IconName } from "./icons";
 import { useI18n } from "./i18n-provider";
 import { cx } from "./ui";
 
-const NAV: { href: string; key: "dashboard" | "customers" | "quotations" | "invoices" | "followUps" | "reports" | "settings"; icon: IconName }[] = [
-  { href: "/", key: "dashboard", icon: "dashboard" },
+const NAV: { href: string; key: "dashboard" | "customers" | "quotations" | "invoices" | "followUps" | "reports" | "settings" | "billing"; icon: IconName }[] = [
+  { href: "/dashboard", key: "dashboard", icon: "dashboard" },
   { href: "/customers", key: "customers", icon: "customers" },
   { href: "/quotations", key: "quotations", icon: "quotations" },
   { href: "/invoices", key: "invoices", icon: "invoices" },
   { href: "/follow-ups", key: "followUps", icon: "followUps" },
   { href: "/reports", key: "reports", icon: "reports" },
   { href: "/settings", key: "settings", icon: "settings" },
+  { href: "/billing", key: "billing", icon: "billing" },
 ];
 
 export function Sidebar({ businessName, username, reminders }: { businessName: string; username: string; reminders: number }) {
@@ -26,7 +27,7 @@ export function Sidebar({ businessName, username, reminders }: { businessName: s
   const [open, setOpen] = useState(false);
   useEffect(() => setOpen(false), [pathname]);
 
-  const isActive = (href: string) => (href === "/" ? pathname === "/" : pathname.startsWith(href));
+  const isActive = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
 
   const nav = (
     <nav className="flex flex-1 flex-col gap-0.5 px-3" aria-label="Main">

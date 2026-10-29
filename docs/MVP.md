@@ -1,3 +1,5 @@
+> This document describes the 1.0 self-hosted MVP. Version 2.0 turned BizFlow into a hosted subscription service; see [SETUP.md](SETUP.md) for the current architecture and [BILLING.md](BILLING.md) for payments.
+
 # BizFlow Kit — MVP definition and storage strategy
 
 ## Who it is for

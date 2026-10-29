@@ -2,17 +2,15 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getDb } from "@/lib/db";
 import { createCustomer, setCustomerArchived, updateCustomer } from "@/lib/services/customers";
-import { requireUser } from "@/lib/server/context";
+import { requireAccess } from "@/lib/server/context";
 import { toActionError, type ActionResult } from "@/lib/server/action";
 import type { CustomerFormValues } from "@/lib/validation";
 
 export async function saveCustomerAction(id: number | null, input: CustomerFormValues): Promise<ActionResult> {
-  await requireUser();
+  const { db } = await requireAccess();
   let savedId: number;
   try {
-    const db = getDb();
     savedId = id ? updateCustomer(db, id, input as never).id : createCustomer(db, input as never).id;
   } catch (e) {
     return toActionError(e);
@@ -22,9 +20,9 @@ export async function saveCustomerAction(id: number | null, input: CustomerFormV
 }
 
 export async function archiveCustomerAction(form: FormData) {
-  await requireUser();
+  const { db } = await requireAccess();
   const id = Number(form.get("id"));
-  setCustomerArchived(getDb(), id, form.get("archive") === "1");
+  setCustomerArchived(db, id, form.get("archive") === "1");
   revalidatePath("/customers");
   revalidatePath(`/customers/${id}`);
 }

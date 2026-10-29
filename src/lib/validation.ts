@@ -191,15 +191,30 @@ export const passwordSchema = z
   .min(10, "Use at least 10 characters")
   .max(200, "Password is too long");
 
-export const setupSchema = z.object({
-  username: z
-    .string()
-    .trim()
-    .min(3, "Use at least 3 characters")
-    .max(40)
-    .regex(/^[a-zA-Z0-9._-]+$/, "Letters, digits, dot, dash and underscore only"),
-  password: passwordSchema,
-});
+/** Messages come from the visitor's dictionary so signup errors read in their language. */
+export interface AuthMessages {
+  nameRequired: string;
+  businessRequired: string;
+  emailInvalid: string;
+  passwordShort: string;
+  passwordLong: string;
+  termsRequired: string;
+}
+
+const email = (m: AuthMessages) => z.string().trim().toLowerCase().max(254, m.emailInvalid).pipe(z.email({ message: m.emailInvalid }));
+const newPassword = (m: AuthMessages) => z.string().min(10, m.passwordShort).max(200, m.passwordLong);
+
+export const signupSchema = (m: AuthMessages) =>
+  z.object({
+    name: z.string().trim().min(2, m.nameRequired).max(80, m.nameRequired),
+    businessName: z.string().trim().min(2, m.businessRequired).max(120, m.businessRequired),
+    email: email(m),
+    password: newPassword(m),
+    terms: z.literal("on", { message: m.termsRequired }),
+  });
+
+export const emailSchema = (m: AuthMessages) => email(m);
+export const newPasswordSchema = (m: AuthMessages) => newPassword(m);
 
 /** Flatten zod issues into { "items.0.quantity": "message" } for forms. */
 export function fieldErrors(error: z.ZodError): Record<string, string> {

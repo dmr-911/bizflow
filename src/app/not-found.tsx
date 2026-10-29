@@ -6,7 +6,7 @@ export default function NotFound() {
       <p className="text-sm font-semibold text-brand-600">404</p>
       <h1 className="mt-1 text-xl font-semibold">Page not found</h1>
       <Link href="/" className="mt-4 text-sm text-brand-600 hover:underline">
-        ← Dashboard
+        ← Home
       </Link>
     </main>
   );

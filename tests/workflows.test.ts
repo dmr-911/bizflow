@@ -19,7 +19,17 @@ import { dashboardStats, mostActiveCustomers, outstandingBalances, revenueByMont
 import { getSettings, saveSettings } from "@/lib/services/settings";
 import { exportBackup, resetBusinessData, restoreBackup } from "@/lib/services/data";
 import { seedDemoData } from "@/lib/services/seed";
-import { authenticate, createSession, createUser, sessionUser } from "@/lib/services/auth";
+import {
+  authenticate,
+  createAccount,
+  createPasswordReset,
+  createSession,
+  EmailTakenError,
+  isResetTokenValid,
+  resetPassword,
+  sessionUser,
+} from "@/lib/services/auth";
+import { CONTROL_MIGRATIONS } from "@/lib/db/control-migrations";
 import { toCsv } from "@/lib/csv";
 
 let db: DB;
@@ -257,16 +267,37 @@ describe("demo data, reset and backup", () => {
 });
 
 describe("auth", () => {
-  it("hashes passwords and validates sessions", () => {
-    createUser(db, "owner", "correct horse battery");
-    expect(authenticate(db, "owner", "wrong password!")).toBeNull();
-    const u = authenticate(db, "OWNER", "correct horse battery");
-    expect(u?.username).toBe("owner");
-    const hash = (db.prepare("SELECT password_hash FROM users").get() as { password_hash: string }).password_hash;
+  it("creates an account with a trial, hashes passwords and validates sessions", () => {
+    const control = openDatabase(":memory:", CONTROL_MIGRATIONS);
+    const { accountId, userId } = createAccount(
+      control,
+      { name: "Farhana", businessName: "Rahman Textiles", email: "Owner@Example.com", password: "correct horse battery" },
+      { trialDays: 14 },
+    );
+    expect(() =>
+      createAccount(control, { name: "X", businessName: "Y", email: "owner@example.com", password: "another password" }, { trialDays: 14 }),
+    ).toThrow(EmailTakenError);
+    expect(authenticate(control, "owner@example.com", "wrong password!")).toBeNull();
+    const u = authenticate(control, " OWNER@example.com ", "correct horse battery");
+    expect(u).toMatchObject({ id: userId, accountId, email: "owner@example.com", businessName: "Rahman Textiles" });
+    const hash = (control.prepare("SELECT password_hash FROM users").get() as { password_hash: string }).password_hash;
     expect(hash).not.toContain("correct");
-    const { token } = createSession(db, u!.id, 1);
-    expect(sessionUser(db, token)?.id).toBe(u!.id);
-    expect(sessionUser(db, token + "x")).toBeNull();
+    const { token } = createSession(control, u!.id, 1);
+    expect(sessionUser(control, token)?.accountId).toBe(accountId);
+    expect(sessionUser(control, token + "x")).toBeNull();
+  });
+
+  it("resets a password once with an emailed token and signs out old sessions", () => {
+    const control = openDatabase(":memory:", CONTROL_MIGRATIONS);
+    const { userId } = createAccount(control, { name: "A", businessName: "B", email: "a@example.com", password: "first password 1" }, { trialDays: 14 });
+    const { token: session } = createSession(control, userId, 1);
+    expect(createPasswordReset(control, "nobody@example.com")).toBeNull();
+    const reset = createPasswordReset(control, "A@example.com")!;
+    expect(isResetTokenValid(control, reset)).toBe(true);
+    expect(resetPassword(control, reset, "second password 2")).toBe(userId);
+    expect(resetPassword(control, reset, "third password 3")).toBeNull();
+    expect(sessionUser(control, session)).toBeNull();
+    expect(authenticate(control, "a@example.com", "second password 2")?.id).toBe(userId);
   });
 });
 

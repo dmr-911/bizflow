@@ -1,74 +1,69 @@
-# BizFlow Kit
+# BizFlow
 
-Self-hosted digital operations for freelancers and small businesses: customers, quotations, invoices, payments, follow-ups and reports, in English and Bangla, with BDT and USD.
+Hosted invoicing for freelancers and small businesses: customers, quotations, invoices, payments, follow-ups and reports, in English and Bangla, with BDT and USD.
 
-No subscriptions and no external services. One Node.js app and one SQLite file.
+**Plan:** US$5/month by card (Stripe) or ৳600/month by bKash, after a 14-day free trial with no card.
 
 ## Features
 
-- **Dashboard**: invoice and quotation counts, received and outstanding amounts (per currency), overdue totals, monthly revenue chart, upcoming follow-ups, recent activity
-- **Customers**: create, edit, search, archive; contact details and notes; each customer's quotations, invoices, balance and history
-- **Quotations**: products/services with quantities, discounts and taxes; exact totals; print/PDF; convert accepted quotations to invoices
-- **Invoices**: unique numbers; draft, sent, partially paid, paid, overdue and cancelled; partial and full payments; payment history; print/PDF
-- **Follow-ups**: due dates and notes; pending, overdue and completed filters; in-app reminders
-- **Reports**: revenue by month, outstanding balances with aging, most active customers, CSV export
-- **Localization**: English and বাংলা, BDT (৳) and USD ($), configurable business details, numbering, date format and tax rates
-- **Data**: demo data, reset, JSON backup/restore, CLI backups
+- **Landing page** describing the problem and product, pricing and FAQ, in English and বাংলা, plus Terms, Privacy and Refund pages
+- **Accounts**: public sign-up, sign in, password reset by email; each business gets its own private database
+- **Billing**: Stripe Checkout subscriptions with customer portal, bKash Tokenized Checkout monthly payments, payment history, trial banner, access paused (data kept and exportable) when unpaid
+- **Dashboard**: invoice and quotation counts, received and outstanding amounts per currency, overdue totals, revenue chart, follow-ups, activity
+- **Customers, quotations and invoices**: discounts and taxes, exact totals, print/PDF, quotation to invoice conversion, partial payments, overdue tracking
+- **Follow-ups and reports**: reminders, revenue by month, aging, most active customers, CSV export
+- **Data**: demo data, JSON backup/restore, account deletion
 
 ## Quick start
 
 ```bash
 npm ci
-npm run build
-npm start          # http://localhost:3000
+cp .env.example .env
+npm run dev          # http://localhost:3000
 ```
 
-Create the owner account on first visit, then load demo data from **Settings** or run `npm run db:seed`.
-
-Requires Node.js 22+. See [docs/SETUP.md](docs/SETUP.md) for production deployment, HTTPS and backups.
+Open `/signup` to create an account. Add Stripe and bKash sandbox keys to `.env` to try payments ([docs/BILLING.md](docs/BILLING.md)). Requires Node.js 22+.
 
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
-| [docs/MVP.md](docs/MVP.md) | Scope, storage decision and costs |
-| [docs/SETUP.md](docs/SETUP.md) | Installation, deployment, configuration, backups, security checklist |
+| [docs/SETUP.md](docs/SETUP.md) | Architecture, configuration, VPS deployment, backups, security checklist, CLI |
+| [docs/BILLING.md](docs/BILLING.md) | How billing works; Stripe and bKash test setup; getting live merchant credentials |
 | [docs/USER_MANUAL.md](docs/USER_MANUAL.md) | How to use every screen |
-| [docs/DATABASE.md](docs/DATABASE.md) | Schema, conventions, status rules |
+| [docs/DATABASE.md](docs/DATABASE.md) | Control and business database schemas, conventions, status rules |
 | [docs/LOCALIZATION.md](docs/LOCALIZATION.md) | Translation structure and adding languages |
-| [docs/COMMERCIAL.md](docs/COMMERCIAL.md) | Editions, pricing ideas, release and white-label checklist |
-| [LICENSE.md](LICENSE.md) | Commercial license template |
+| [docs/MVP.md](docs/MVP.md) | Original 1.0 self-hosted scope |
 
 ## Tech stack
 
-Next.js 15 (App Router, server actions) · TypeScript · Tailwind CSS 4 · React Hook Form · Zod · better-sqlite3 · Vitest
+Next.js 15 (App Router, server actions) · TypeScript · Tailwind CSS 4 · React Hook Form · Zod · better-sqlite3 · Stripe · bKash Tokenized Checkout · Nodemailer · Vitest
 
 ## Project layout
 
 ```
 src/
-  app/                 routes (pages, server actions, CSV/backup API, print views)
-  components/          reusable UI (forms, tables, document template, sidebar)
+  app/                 routes: landing and legal pages, auth pages, (app) business screens,
+                       billing, server actions, webhook/callback/export APIs, print views
+  components/          UI (forms, tables, document template, sidebar, marketing sections)
   lib/
-    money.ts calc.ts   integer money and tax/discount calculation
-    status.ts          invoice and quotation state machines
-    numbering.ts       unique document numbers
-    validation.ts      Zod schemas for all input
-    db/                SQLite connection and migrations
-    services/          business logic (the only code that touches the database)
+    db/                connections, control and business migrations
+    services/          business logic, auth and billing (the only code that touches SQL)
+    billing/           Stripe and bKash clients, Stripe event handling
+    server/            request context (session, subscription gate), mail, rate limits
     i18n/              English and Bangla dictionaries
-scripts/db.ts          maintenance CLI (seed, reset, backup, set-password)
-tests/                 unit and workflow tests
+scripts/db.ts          maintenance CLI (migrate, backup, accounts, seed, grant, set-password)
+tests/                 unit, workflow and billing tests
 ```
 
 ## Development
 
 ```bash
-npm run dev          # hot reload
-npm test             # 55 tests: money, tax, statuses, numbering, workflows, reports, backup, auth, i18n
+npm run dev
+npm test             # money, tax, statuses, numbering, workflows, auth, billing, webhooks, bKash, tenant isolation
 npm run typecheck
 ```
 
 ## License
 
-Commercial. See [LICENSE.md](LICENSE.md) (template to be completed by the licensor).
+Commercial. See [LICENSE.md](LICENSE.md).

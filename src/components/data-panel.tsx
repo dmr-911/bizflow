@@ -14,7 +14,7 @@ function Result({ state }: { state: ActionResult | null }) {
   return <Alert tone={state.ok ? "success" : "error"}>{state.ok ? state.message : state.error}</Alert>;
 }
 
-function DangerForm({
+export function DangerForm({
   action,
   word,
   title,

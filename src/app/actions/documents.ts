@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getDb } from "@/lib/db";
+import type { DB } from "@/lib/db";
 import { todayIso } from "@/lib/dates";
 import {
   cancelInvoice,
@@ -18,7 +18,7 @@ import {
   updateDocument,
   type DocumentKind,
 } from "@/lib/services/documents";
-import { requireUser } from "@/lib/server/context";
+import { requireAccess } from "@/lib/server/context";
 import { toActionError, type ActionResult } from "@/lib/server/action";
 import type { QuotationStatus } from "@/lib/status";
 import type { DocumentFormValues } from "@/lib/validation";
@@ -28,14 +28,13 @@ const base = (kind: DocumentKind) => (kind === "invoice" ? "/invoices" : "/quota
 function refresh(kind: DocumentKind, id?: number) {
   revalidatePath(base(kind));
   if (id) revalidatePath(`${base(kind)}/${id}`);
-  revalidatePath("/");
+  revalidatePath("/dashboard");
 }
 
 export async function saveDocumentAction(kind: DocumentKind, id: number | null, input: DocumentFormValues): Promise<ActionResult> {
-  await requireUser();
+  const { db } = await requireAccess();
   let savedId: number;
   try {
-    const db = getDb();
     savedId = id ? updateDocument(db, id, input).id : createDocument(db, kind, input).id;
   } catch (e) {
     return toActionError(e);
@@ -48,11 +47,11 @@ export async function saveDocumentAction(kind: DocumentKind, id: number | null, 
  * Runs a lifecycle change from a plain <form> button. Errors come back as a
  * query parameter so these buttons work without client-side JavaScript.
  */
-async function lifecycle(kind: DocumentKind, id: number, fn: () => number | void) {
-  await requireUser();
+async function lifecycle(kind: DocumentKind, id: number, fn: (db: DB) => number | void) {
+  const { db } = await requireAccess();
   let target = `${base(kind)}/${id}`;
   try {
-    const next = fn();
+    const next = fn(db);
     if (typeof next === "number") target = `/invoices/${next}`;
   } catch (e) {
     const r = toActionError(e);
@@ -65,13 +64,13 @@ async function lifecycle(kind: DocumentKind, id: number, fn: () => number | void
 export async function quotationStatusAction(form: FormData) {
   const id = Number(form.get("id"));
   const to = String(form.get("to")) as QuotationStatus;
-  await lifecycle("quotation", id, () => void setQuotationStatus(getDb(), id, to));
+  await lifecycle("quotation", id, (db) => void setQuotationStatus(db, id, to));
 }
 
 export async function convertQuotationAction(form: FormData) {
   const id = Number(form.get("id"));
-  await lifecycle("quotation", id, () => {
-    const inv = convertQuotationToInvoice(getDb(), id, todayIso());
+  await lifecycle("quotation", id, (db) => {
+    const inv = convertQuotationToInvoice(db, id, todayIso());
     revalidatePath("/invoices");
     return inv.id;
   });
@@ -80,8 +79,7 @@ export async function convertQuotationAction(form: FormData) {
 export async function invoiceStatusAction(form: FormData) {
   const id = Number(form.get("id"));
   const to = String(form.get("to"));
-  await lifecycle("invoice", id, () => {
-    const db = getDb();
+  await lifecycle("invoice", id, (db) => {
     if (to === "sent") markInvoiceSent(db, id);
     else if (to === "draft") revertInvoiceToDraft(db, id);
     else if (to === "cancelled") cancelInvoice(db, id);
@@ -89,11 +87,10 @@ export async function invoiceStatusAction(form: FormData) {
 }
 
 export async function deleteDraftAction(form: FormData) {
-  await requireUser();
+  const { db } = await requireAccess();
   const id = Number(form.get("id"));
-  const db = getDb();
   const doc = getDocument(db, id);
-  if (!doc) redirect("/");
+  if (!doc) redirect("/dashboard");
   try {
     deleteDraftDocument(db, id);
   } catch (e) {
@@ -106,9 +103,9 @@ export async function deleteDraftAction(form: FormData) {
 }
 
 export async function recordPaymentAction(invoiceId: number, _: ActionResult | null, form: FormData): Promise<ActionResult> {
-  await requireUser();
+  const { db } = await requireAccess();
   try {
-    recordPayment(getDb(), invoiceId, Object.fromEntries(form));
+    recordPayment(db, invoiceId, Object.fromEntries(form));
   } catch (e) {
     return toActionError(e);
   }
@@ -119,5 +116,5 @@ export async function recordPaymentAction(invoiceId: number, _: ActionResult | n
 export async function deletePaymentAction(form: FormData) {
   const paymentId = Number(form.get("paymentId"));
   const invoiceId = Number(form.get("invoiceId"));
-  await lifecycle("invoice", invoiceId, () => void deletePayment(getDb(), paymentId));
+  await lifecycle("invoice", invoiceId, (db) => void deletePayment(db, paymentId));
 }
