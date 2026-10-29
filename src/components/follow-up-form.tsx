@@ -26,23 +26,52 @@ export function FollowUpForm({
     if (state?.ok) formRef.current?.reset();
   }, [state]);
   const err = state && !state.ok ? state.fieldErrors : undefined;
-  const uid = documentId ? `d${documentId}` : defaultCustomerId ? `c${defaultCustomerId}` : "g";
+  const uid = documentId
+    ? `d${documentId}`
+    : defaultCustomerId
+      ? `c${defaultCustomerId}`
+      : "g";
 
   return (
     <form ref={formRef} onSubmit={onSubmit} className="space-y-3">
       <p className="text-sm font-semibold text-slate-800">{t.followUps.add}</p>
       {state && !state.ok && <Alert tone="error">{state.error}</Alert>}
-      <div className={compact ? "grid grid-cols-1 gap-3" : "grid grid-cols-1 gap-3 sm:grid-cols-2"}>
-        <Field label={t.followUps.what} htmlFor={`fu-title-${uid}`} error={err?.title}>
+      <div
+        className={
+          compact
+            ? "grid grid-cols-1 gap-3"
+            : "grid grid-cols-1 gap-3 sm:grid-cols-2"
+        }
+      >
+        <Field
+          className="sm:col-span-2"
+          label={t.followUps.what}
+          htmlFor={`fu-title-${uid}`}
+          error={err?.title}
+        >
           <Input id={`fu-title-${uid}`} name="title" required maxLength={200} />
         </Field>
-        <Field label={t.followUps.due} htmlFor={`fu-date-${uid}`} error={err?.dueDate}>
-          <Input id={`fu-date-${uid}`} name="dueDate" type="date" required defaultValue={defaultDate} />
+        <Field
+          label={t.followUps.due}
+          htmlFor={`fu-date-${uid}`}
+          error={err?.dueDate}
+        >
+          <Input
+            id={`fu-date-${uid}`}
+            name="dueDate"
+            type="date"
+            required
+            defaultValue={defaultDate}
+          />
         </Field>
         {defaultCustomerId ? (
           <input type="hidden" name="customerId" value={defaultCustomerId} />
         ) : (
-          <Field label={t.common.customer} htmlFor={`fu-customer-${uid}`} error={err?.customerId}>
+          <Field
+            label={t.common.customer}
+            htmlFor={`fu-customer-${uid}`}
+            error={err?.customerId}
+          >
             <Select id={`fu-customer-${uid}`} name="customerId" defaultValue="">
               <option value="">{t.common.none}</option>
               {customers.map((c) => (
@@ -54,9 +83,16 @@ export function FollowUpForm({
             </Select>
           </Field>
         )}
-        {documentId && <input type="hidden" name="documentId" value={documentId} />}
+        {documentId && (
+          <input type="hidden" name="documentId" value={documentId} />
+        )}
         {!compact && (
-          <Field label={t.followUps.note} htmlFor={`fu-note-${uid}`} error={err?.note} className="sm:col-span-2">
+          <Field
+            label={t.followUps.note}
+            htmlFor={`fu-note-${uid}`}
+            error={err?.note}
+            className="sm:col-span-2"
+          >
             <Textarea id={`fu-note-${uid}`} name="note" rows={2} />
           </Field>
         )}
