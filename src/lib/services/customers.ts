@@ -22,7 +22,8 @@ export interface Customer {
 export interface CustomerListRow extends Customer {
   invoiceCount: number;
   quotationCount: number;
-  outstanding: number;
+  /** Unpaid balance on issued invoices, per currency. */
+  outstanding: Partial<Record<"BDT" | "USD", number>>;
 }
 
 const columns = (t = "") =>
@@ -98,18 +99,31 @@ export function listCustomers(
       "(c.name LIKE @q ESCAPE '\\' OR c.company LIKE @q ESCAPE '\\' OR c.email LIKE @q ESCAPE '\\' OR c.phone LIKE @q ESCAPE '\\')",
     );
   }
-  return db
+  const rows = db
     .prepare(
       `SELECT ${columns("c.")},
         (SELECT COUNT(*) FROM documents d WHERE d.customer_id = c.id AND d.kind = 'invoice') AS invoiceCount,
-        (SELECT COUNT(*) FROM documents d WHERE d.customer_id = c.id AND d.kind = 'quotation') AS quotationCount,
-        (SELECT COALESCE(SUM(d.total - d.amount_paid), 0) FROM documents d
-           WHERE d.customer_id = c.id AND d.kind = 'invoice' AND d.status IN ('sent','partially_paid')) AS outstanding
+        (SELECT COUNT(*) FROM documents d WHERE d.customer_id = c.id AND d.kind = 'quotation') AS quotationCount
        FROM customers c
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
        ORDER BY c.name COLLATE NOCASE`,
     )
-    .all(params) as CustomerListRow[];
+    .all(params) as Omit<CustomerListRow, "outstanding">[];
+  const balances = customerBalances(db);
+  return rows.map((r) => ({ ...r, outstanding: balances.get(r.id) ?? {} }));
+}
+
+export function customerBalances(db: DB, customerId?: number): Map<number, CustomerListRow["outstanding"]> {
+  const rows = db
+    .prepare(
+      `SELECT customer_id AS id, currency, SUM(total - amount_paid) AS amount FROM documents
+       WHERE kind = 'invoice' AND status IN ('sent','partially_paid') ${customerId ? "AND customer_id = ?" : ""}
+       GROUP BY customer_id, currency`,
+    )
+    .all(...(customerId ? [customerId] : [])) as { id: number; currency: "BDT" | "USD"; amount: number }[];
+  const map = new Map<number, CustomerListRow["outstanding"]>();
+  for (const r of rows) map.set(r.id, { ...map.get(r.id), [r.currency]: r.amount });
+  return map;
 }
 
 /** Lightweight list for pickers. */

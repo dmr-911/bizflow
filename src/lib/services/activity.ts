@@ -8,6 +8,7 @@ export interface Activity {
   customerId: number | null;
   customerName: string | null;
   documentId: number | null;
+  documentKind: "quotation" | "invoice" | null;
   createdAt: string;
 }
 
@@ -26,8 +27,8 @@ export function recentActivity(db: DB, opts: { limit?: number; customerId?: numb
   return db
     .prepare(
       `SELECT a.id, a.type, a.message, a.customer_id AS customerId, c.name AS customerName,
-              a.document_id AS documentId, a.created_at AS createdAt
-       FROM activities a LEFT JOIN customers c ON c.id = a.customer_id
+              a.document_id AS documentId, d.kind AS documentKind, a.created_at AS createdAt
+       FROM activities a LEFT JOIN customers c ON c.id = a.customer_id LEFT JOIN documents d ON d.id = a.document_id
        ${where}
        ORDER BY a.created_at DESC, a.id DESC LIMIT ?`,
     )
