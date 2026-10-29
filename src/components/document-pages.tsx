@@ -37,7 +37,7 @@ export async function DocumentListPage({ kind, searchParams }: { kind: DocumentK
   const { db, t, fmt } = await pageContext();
   const { status = "all", q = "" } = await searchParams;
   const filter = FILTERS[kind].includes(status) ? status : "all";
-  const all = listDocuments(db, kind, { search: q });
+  const all = await listDocuments(db, kind, { search: q });
   const rows = filter === "all" ? all : all.filter((r) => r.displayStatus === filter);
   const count = (s: string) => (s === "all" ? all.length : all.filter((r) => r.displayStatus === s).length);
   const href = (s: string) => `${path(kind)}?status=${s}${q ? `&q=${encodeURIComponent(q)}` : ""}`;
@@ -128,7 +128,7 @@ function toFormValues(doc: DocumentDetail, settings: Settings): DocumentFormValu
 export async function DocumentNewPage({ kind, searchParams }: { kind: DocumentKind; searchParams: Promise<{ customer?: string }> }) {
   const { db, t, settings } = await pageContext();
   const { customer } = await searchParams;
-  const customers = customerOptions(db);
+  const customers = await customerOptions(db);
   const today = todayIso();
   const isInvoice = kind === "invoice";
   const initial: DocumentFormValues = {
@@ -158,15 +158,16 @@ export async function DocumentNewPage({ kind, searchParams }: { kind: DocumentKi
 
 export async function DocumentEditPage({ kind, params }: { kind: DocumentKind; params: Promise<{ id: string }> }) {
   const { db, t, settings } = await pageContext();
-  const doc = getDocument(db, Number((await params).id));
+  const doc = await getDocument(db, Number((await params).id));
   if (!doc || doc.kind !== kind) notFound();
+  const customers = await customerOptions(db, doc.customerId);
   const editable = kind === "invoice" ? isInvoiceEditable(doc.status as InvoiceStatus) : isQuotationEditable(doc.status as QuotationStatus);
   return (
     <>
       <PageHeader title={kind === "invoice" ? t.documents.editInvoice : t.documents.editQuotation} subtitle={doc.number} />
       <Card>
         {editable ? (
-          <DocumentForm kind={kind} id={doc.id} initial={toFormValues(doc, settings)} customers={customerOptions(db, doc.customerId)} taxRates={settings.taxRates} cancelHref={`${path(kind)}/${doc.id}`} />
+          <DocumentForm kind={kind} id={doc.id} initial={toFormValues(doc, settings)} customers={customers} taxRates={settings.taxRates} cancelHref={`${path(kind)}/${doc.id}`} />
         ) : (
           <Alert tone="warning">{t.documents.lockedNotice}</Alert>
         )}
@@ -189,11 +190,12 @@ function ActionForm({ action, id, to, children }: { action: (f: FormData) => Pro
 
 export async function DocumentDetailPage({ kind, params, searchParams }: { kind: DocumentKind; params: Promise<{ id: string }>; searchParams: Promise<{ error?: string }> }) {
   const { db, t, fmt, settings } = await pageContext();
-  const doc = getDocument(db, Number((await params).id));
+  const doc = await getDocument(db, Number((await params).id));
   if (!doc || doc.kind !== kind) notFound();
   const { error } = await searchParams;
-  const customer = getCustomer(db, doc.customerId)!;
-  const followUps = listFollowUps(db, {}).filter((f) => f.documentId === doc.id);
+  const [found, allFollowUps] = await Promise.all([getCustomer(db, doc.customerId), listFollowUps(db, {})]);
+  const customer = found!;
+  const followUps = allFollowUps.filter((f) => f.documentId === doc.id);
   const isInvoice = kind === "invoice";
   const s = doc.status;
   const editable = isInvoice ? isInvoiceEditable(s as InvoiceStatus) : isQuotationEditable(s as QuotationStatus);

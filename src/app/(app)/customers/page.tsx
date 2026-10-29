@@ -10,7 +10,7 @@ export default async function CustomersPage({ searchParams }: { searchParams: Pr
   const { db, t, fmt, settings } = await pageContext();
   const { q = "", view = "active" } = await searchParams;
   const archived = view === "archived";
-  const rows = listCustomers(db, { search: q, archivedOnly: archived });
+  const rows = await listCustomers(db, { search: q, archivedOnly: archived });
   const qs = (v: string) => `/customers?view=${v}${q ? `&q=${encodeURIComponent(q)}` : ""}`;
 
   return (

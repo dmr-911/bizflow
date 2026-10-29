@@ -17,16 +17,16 @@ export async function setLocaleAction(form: FormData) {
   const locale = form.get("locale") === "bn" ? "bn" : "en";
   (await cookies()).set(LOCALE_COOKIE, locale, { path: "/", maxAge: 365 * 86_400, sameSite: "lax" });
   const user = await currentUser();
-  if (user) updateSettings(getTenantDb(user.accountId), (s) => ({ ...s, locale }));
+  if (user) await updateSettings(await getTenantDb(user.accountId), (s) => ({ ...s, locale }));
   revalidatePath("/", "layout");
 }
 
 export async function saveSettingsAction(input: Settings): Promise<ActionResult> {
   const { db } = await requireAccess();
   try {
-    saveSettings(db, input);
+    const saved = await saveSettings(db, input);
     revalidatePath("/", "layout");
-    return { ok: true, message: getDictionary(getSettings(db).locale).settings.saved };
+    return { ok: true, message: getDictionary(saved.locale).settings.saved };
   } catch (e) {
     return toActionError(e);
   }
@@ -39,7 +39,7 @@ function confirmed(form: FormData, word: string) {
 export async function loadDemoAction(_: ActionResult | null, form: FormData): Promise<ActionResult> {
   const { db } = await requireAccess();
   if (!confirmed(form, "DEMO")) return { ok: false, error: "Type DEMO to confirm." };
-  seedDemoData(db);
+  await seedDemoData(db);
   revalidatePath("/", "layout");
   redirect("/dashboard?demo=1");
 }
@@ -47,9 +47,9 @@ export async function loadDemoAction(_: ActionResult | null, form: FormData): Pr
 export async function resetDataAction(_: ActionResult | null, form: FormData): Promise<ActionResult> {
   const { db } = await requireAccess();
   if (!confirmed(form, "RESET")) return { ok: false, error: "Type RESET to confirm." };
-  resetBusinessData(db);
+  await resetBusinessData(db);
   revalidatePath("/", "layout");
-  return { ok: true, message: getDictionary(getSettings(db).locale).settings.resetDone };
+  return { ok: true, message: getDictionary((await getSettings(db)).locale).settings.resetDone };
 }
 
 export async function restoreBackupAction(_: ActionResult | null, form: FormData): Promise<ActionResult> {
@@ -60,12 +60,12 @@ export async function restoreBackupAction(_: ActionResult | null, form: FormData
   if (!confirmed(form, "RESTORE")) return { ok: false, error: "Type RESTORE to confirm." };
   try {
     const backup = JSON.parse(await file.text()) as Backup;
-    restoreBackup(db, backup);
+    await restoreBackup(db, backup);
   } catch (e) {
     if (e instanceof SyntaxError) return { ok: false, error: "That file is not valid JSON." };
     if (e instanceof Error && e.message.startsWith("Not a BizFlow")) return { ok: false, error: e.message };
     return toActionError(e);
   }
   revalidatePath("/", "layout");
-  return { ok: true, message: getDictionary(getSettings(db).locale).settings.restoreDone };
+  return { ok: true, message: getDictionary((await getSettings(db)).locale).settings.restoreDone };
 }

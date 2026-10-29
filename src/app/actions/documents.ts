@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import type { DB } from "@/lib/db";
+import type { TenantDb } from "@/lib/db";
 import { todayIso } from "@/lib/dates";
 import {
   cancelInvoice,
@@ -35,7 +35,7 @@ export async function saveDocumentAction(kind: DocumentKind, id: number | null, 
   const { db } = await requireAccess();
   let savedId: number;
   try {
-    savedId = id ? updateDocument(db, id, input).id : createDocument(db, kind, input).id;
+    savedId = id ? (await updateDocument(db, id, input)).id : (await createDocument(db, kind, input)).id;
   } catch (e) {
     return toActionError(e);
   }
@@ -47,11 +47,11 @@ export async function saveDocumentAction(kind: DocumentKind, id: number | null, 
  * Runs a lifecycle change from a plain <form> button. Errors come back as a
  * query parameter so these buttons work without client-side JavaScript.
  */
-async function lifecycle(kind: DocumentKind, id: number, fn: (db: DB) => number | void) {
+async function lifecycle(kind: DocumentKind, id: number, fn: (db: TenantDb) => Promise<number | void>) {
   const { db } = await requireAccess();
   let target = `${base(kind)}/${id}`;
   try {
-    const next = fn(db);
+    const next = await fn(db);
     if (typeof next === "number") target = `/invoices/${next}`;
   } catch (e) {
     const r = toActionError(e);
@@ -64,13 +64,15 @@ async function lifecycle(kind: DocumentKind, id: number, fn: (db: DB) => number 
 export async function quotationStatusAction(form: FormData) {
   const id = Number(form.get("id"));
   const to = String(form.get("to")) as QuotationStatus;
-  await lifecycle("quotation", id, (db) => void setQuotationStatus(db, id, to));
+  await lifecycle("quotation", id, async (db) => {
+    await setQuotationStatus(db, id, to);
+  });
 }
 
 export async function convertQuotationAction(form: FormData) {
   const id = Number(form.get("id"));
-  await lifecycle("quotation", id, (db) => {
-    const inv = convertQuotationToInvoice(db, id, todayIso());
+  await lifecycle("quotation", id, async (db) => {
+    const inv = await convertQuotationToInvoice(db, id, todayIso());
     revalidatePath("/invoices");
     return inv.id;
   });
@@ -79,20 +81,20 @@ export async function convertQuotationAction(form: FormData) {
 export async function invoiceStatusAction(form: FormData) {
   const id = Number(form.get("id"));
   const to = String(form.get("to"));
-  await lifecycle("invoice", id, (db) => {
-    if (to === "sent") markInvoiceSent(db, id);
-    else if (to === "draft") revertInvoiceToDraft(db, id);
-    else if (to === "cancelled") cancelInvoice(db, id);
+  await lifecycle("invoice", id, async (db) => {
+    if (to === "sent") await markInvoiceSent(db, id);
+    else if (to === "draft") await revertInvoiceToDraft(db, id);
+    else if (to === "cancelled") await cancelInvoice(db, id);
   });
 }
 
 export async function deleteDraftAction(form: FormData) {
   const { db } = await requireAccess();
   const id = Number(form.get("id"));
-  const doc = getDocument(db, id);
+  const doc = await getDocument(db, id);
   if (!doc) redirect("/dashboard");
   try {
-    deleteDraftDocument(db, id);
+    await deleteDraftDocument(db, id);
   } catch (e) {
     const r = toActionError(e);
     redirect(`${base(doc.kind)}/${id}?error=${encodeURIComponent(r.ok ? "" : r.error)}`);
@@ -105,7 +107,7 @@ export async function deleteDraftAction(form: FormData) {
 export async function recordPaymentAction(invoiceId: number, _: ActionResult | null, form: FormData): Promise<ActionResult> {
   const { db } = await requireAccess();
   try {
-    recordPayment(db, invoiceId, Object.fromEntries(form));
+    await recordPayment(db, invoiceId, Object.fromEntries(form));
   } catch (e) {
     return toActionError(e);
   }
@@ -116,5 +118,7 @@ export async function recordPaymentAction(invoiceId: number, _: ActionResult | n
 export async function deletePaymentAction(form: FormData) {
   const paymentId = Number(form.get("paymentId"));
   const invoiceId = Number(form.get("invoiceId"));
-  await lifecycle("invoice", invoiceId, (db) => void deletePayment(db, paymentId));
+  await lifecycle("invoice", invoiceId, async (db) => {
+    await deletePayment(db, paymentId);
+  });
 }

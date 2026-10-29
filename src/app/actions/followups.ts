@@ -12,7 +12,7 @@ function refresh() {
 export async function createFollowUpAction(_: ActionResult | null, form: FormData): Promise<ActionResult> {
   const { db } = await requireAccess();
   try {
-    createFollowUp(db, Object.fromEntries(form));
+    await createFollowUp(db, Object.fromEntries(form));
   } catch (e) {
     return toActionError(e);
   }
@@ -22,12 +22,12 @@ export async function createFollowUpAction(_: ActionResult | null, form: FormDat
 
 export async function toggleFollowUpAction(form: FormData) {
   const { db } = await requireAccess();
-  setFollowUpCompleted(db, Number(form.get("id")), form.get("completed") === "1");
+  await setFollowUpCompleted(db, Number(form.get("id")), form.get("completed") === "1");
   refresh();
 }
 
 export async function deleteFollowUpAction(form: FormData) {
   const { db } = await requireAccess();
-  deleteFollowUp(db, Number(form.get("id")));
+  await deleteFollowUp(db, Number(form.get("id")));
   refresh();
 }

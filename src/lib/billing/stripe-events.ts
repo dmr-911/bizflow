@@ -1,5 +1,5 @@
 import type Stripe from "stripe";
-import type { DB } from "../db";
+import type { Db } from "../db";
 import {
   accountForStripeCustomer,
   recordStripeInvoice,
@@ -14,17 +14,17 @@ export function subscriptionPeriodEnd(sub: Stripe.Subscription): number | null {
 
 const idOf = (v: string | { id: string } | null | undefined) => (typeof v === "string" ? v : (v?.id ?? null));
 
-function accountFor(db: DB, customerId: string | null, metadata?: Stripe.Metadata | null): number | null {
+async function accountFor(db: Db, customerId: string | null, metadata?: Stripe.Metadata | null): Promise<number | null> {
   const fromMeta = Number(metadata?.account_id);
   if (Number.isSafeInteger(fromMeta) && fromMeta > 0) return fromMeta;
   return customerId ? accountForStripeCustomer(db, customerId) : null;
 }
 
-export function applySubscription(db: DB, sub: Stripe.Subscription, accountId?: number | null): void {
+export async function applySubscription(db: Db, sub: Stripe.Subscription, accountId?: number | null): Promise<void> {
   const customerId = idOf(sub.customer)!;
-  const account = accountId ?? accountFor(db, customerId, sub.metadata);
+  const account = accountId ?? (await accountFor(db, customerId, sub.metadata));
   if (!account) return;
-  syncStripeSubscription(db, {
+  await syncStripeSubscription(db, {
     accountId: account,
     customerId,
     subscriptionId: sub.id,
@@ -39,7 +39,7 @@ export function applySubscription(db: DB, sub: Stripe.Subscription, accountId?: 
  * subscription from Stripe, so out-of-order deliveries still end up correct.
  */
 export async function handleStripeEvent(
-  db: DB,
+  db: Db,
   event: Stripe.Event,
   getSubscription: (id: string) => Promise<Stripe.Subscription>,
 ): Promise<void> {
@@ -50,9 +50,9 @@ export async function handleStripeEvent(
       const accountId = Number(session.client_reference_id);
       const customerId = idOf(session.customer);
       if (!Number.isSafeInteger(accountId) || accountId <= 0 || !customerId) return;
-      setStripeCustomer(db, accountId, customerId);
+      await setStripeCustomer(db, accountId, customerId);
       const subId = idOf(session.subscription);
-      if (subId) applySubscription(db, await getSubscription(subId), accountId);
+      if (subId) await applySubscription(db, await getSubscription(subId), accountId);
       return;
     }
     case "customer.subscription.created":
@@ -61,17 +61,17 @@ export async function handleStripeEvent(
     case "customer.subscription.paused":
     case "customer.subscription.resumed":
       // Deleted events carry the final state; for the rest, fetch the latest in case events arrived out of order.
-      applySubscription(db, event.type === "customer.subscription.deleted" ? event.data.object : await getSubscription(event.data.object.id));
+      await applySubscription(db, event.type === "customer.subscription.deleted" ? event.data.object : await getSubscription(event.data.object.id));
       return;
     case "invoice.paid":
     case "invoice.payment_failed": {
       const invoice = event.data.object;
       const customerId = idOf(invoice.customer);
       const subId = idOf(invoice.parent?.subscription_details?.subscription);
-      const accountId = accountFor(db, customerId, invoice.parent?.subscription_details?.metadata);
+      const accountId = await accountFor(db, customerId, invoice.parent?.subscription_details?.metadata);
       if (!accountId || !invoice.id) return;
       const period = invoice.lines?.data?.[0]?.period;
-      recordStripeInvoice(db, {
+      await recordStripeInvoice(db, {
         accountId,
         invoiceId: invoice.id,
         amount: event.type === "invoice.paid" ? invoice.amount_paid : invoice.amount_due,
@@ -80,7 +80,7 @@ export async function handleStripeEvent(
         periodStart: period?.start ?? null,
         periodEnd: period?.end ?? null,
       });
-      if (subId) applySubscription(db, await getSubscription(subId), accountId);
+      if (subId) await applySubscription(db, await getSubscription(subId), accountId);
       return;
     }
     default:
