@@ -1,8 +1,8 @@
-# BizFlow Kit user manual
+# BizFlow user manual
 
 ## First start
 
-1. Open the app. On the **setup** screen choose a username and a password of at least 10 characters. This is the only account; keep the password safe.
+1. Open the site and choose **Start free trial**. Enter your name, business name, email and a password of at least 10 characters. The free trial starts immediately; no card is needed.
 2. Go to **Settings** and fill in **Business details** (name, address, phone, email, tax ID / BIN). These appear on every quotation and invoice.
 3. Check **Language & formats** (English or বাংলা, default currency BDT or USD, date format), **Document numbering** and **Tax rates**. Click **Save**.
 
@@ -79,10 +79,20 @@ The print uses the interface language. Switch to বাংলা for a Bangla do
 - **Tax rates**: add the rates you charge (e.g. *VAT 15%*, *VAT 5%*, *No tax*) and choose a default for new lines. The tax label (VAT, GST, Tax) appears on documents. Changing a rate never changes documents already created.
 - **Defaults**: payment terms in days, quotation validity, default terms text, and a footer line for documents.
 - **Data & backup**: download a JSON backup, restore one (type `RESTORE`), load demo data, or erase everything.
-- **Account**: change your password. Other logged-in devices are signed out.
+- **Account**: change your password. Other logged-in devices are signed out. Forgot it? Use **Forgot password?** on the sign-in page.
+
+## Billing
+
+**Billing** in the menu shows your plan, days left in the trial, and payment history.
+
+- **Pay by card** (US$5/month): opens Stripe's secure checkout. It renews monthly; **Open billing portal** lets you change the card, download receipts or cancel.
+- **Pay with bKash** (৳600/month): opens bKash; approve with your wallet number, OTP and PIN. Each payment adds one month. Pay again before the date shown to continue.
+- Paying during the trial does not cost you the remaining free days.
+- If the trial or paid month ends, the app pauses (your data is kept). You can still download your backup and CSV files from Billing.
+- **Delete account** permanently removes your business data and login and cancels a card subscription.
 
 ## Good habits
 
-- Download a backup every week (or ask your administrator to schedule one — see SETUP.md).
+- Download a backup now and then for your own records. The service also keeps server backups.
 - Record payments the same day you receive them.
 - Use follow-ups for every overdue invoice.

@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import type { DB } from "@/lib/db";
 import { minorToDecimalString } from "@/lib/money";
 import { todayIso } from "@/lib/dates";
 import { toCsv } from "@/lib/csv";
@@ -7,15 +7,14 @@ import { listDocuments } from "@/lib/services/documents";
 import { listFollowUps } from "@/lib/services/followups";
 import { mostActiveCustomers, outstandingBalances, revenueByMonth } from "@/lib/services/reports";
 import { getSettings } from "@/lib/services/settings";
-import { routeUser } from "@/lib/server/route-auth";
+import { routeTenant } from "@/lib/server/route-auth";
 import { addMonths } from "@/lib/dates";
 import type { Currency } from "@/lib/money";
 
 type Cell = string | number | null;
 const m = (v: number, c: Currency = "BDT") => minorToDecimalString(v, c);
 
-function build(kind: string, url: URL): { header: string[]; rows: Cell[][] } | null {
-  const db = getDb();
+function build(db: DB, kind: string, url: URL): { header: string[]; rows: Cell[][] } | null {
   const settings = getSettings(db);
   switch (kind) {
     case "customers":
@@ -85,9 +84,10 @@ function build(kind: string, url: URL): { header: string[]; rows: Cell[][] } | n
 }
 
 export async function GET(req: Request, { params }: { params: Promise<{ kind: string }> }) {
-  if (!(await routeUser())) return new Response("Unauthorized", { status: 401 });
+  const auth = await routeTenant({ allowLapsed: true });
+  if ("error" in auth) return auth.error;
   const { kind } = await params;
-  const data = build(kind, new URL(req.url));
+  const data = build(auth.db, kind, new URL(req.url));
   if (!data) return new Response("Not found", { status: 404 });
   // UTF-8 BOM so Excel shows Bangla text correctly.
   const body = "﻿" + toCsv(data.header, data.rows);

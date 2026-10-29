@@ -1,68 +1,74 @@
-# Setup and deployment guide
+# Setup and deployment
+
+BizFlow is a hosted, multi-tenant web app: anyone can sign up, each business gets its own private database, and a subscription (Stripe or bKash) keeps access open. See [BILLING.md](BILLING.md) for payments.
+
+## Architecture in one paragraph
+
+One Next.js server process. A **control database** (`DATA_DIR/control.db`) holds accounts, logins, sessions and subscriptions. Every business has its **own SQLite file** (`DATA_DIR/tenants/<account id>.db`) with the same schema the self-hosted MVP used, so business data from two accounts can never mix in a query. Files are created and migrated automatically on first use.
+
+## Is SQLite on one server enough?
+
+Yes for launch and well beyond. Each business writes a few hundred rows a day at most; SQLite in WAL mode on an SSD handles thousands of such businesses on a 1–2 vCPU VPS. The app keeps up to `MAX_OPEN_TENANT_DBS` (default 200) database handles open and closes the least recently used.
+
+What it does **not** support: running several app servers behind a load balancer, or serverless hosting (Vercel, Netlify, Cloudflare Workers), because the files live on local disk. When you outgrow one server, the repository layer (`src/lib/services`) is the only code that touches SQL, which keeps a later move to PostgreSQL contained.
 
 ## Requirements
 
-- Node.js **22 or newer** (`node -v`)
-- About 300 MB of disk for dependencies and the build; the database itself is usually a few MB
-- A machine with a **persistent disk**: your own PC, an office server, a VPS, or a Docker host
+- Node.js **22+**
+- A Linux VPS with a persistent SSD (1 vCPU / 1–2 GB RAM is plenty to start; US$5–12/month at Hetzner, DigitalOcean, Vultr or a Bangladeshi provider)
+- A domain name and HTTPS (required by Stripe and bKash)
+- An SMTP provider for password-reset emails (Amazon SES, Postmark, Resend, Mailgun, Zoho, ...)
 
-No external database, email service or paid API is required.
-
-> `better-sqlite3` ships prebuilt binaries for Linux, macOS and Windows on x64 and arm64. On unusual platforms npm compiles it, which needs Python 3 and a C++ toolchain (`build-essential` on Debian/Ubuntu).
-
-## 1. Local install (try it in 5 minutes)
+## 1. Local development
 
 ```bash
-git clone <your copy of the repository> bizflow
-cd bizflow
 npm ci
-cp .env.example .env        # optional; defaults work
-npm run build
-npm start                   # http://localhost:3000
+cp .env.example .env     # defaults work; add Stripe/bKash test keys to try payments
+npm run dev              # http://localhost:3000
 ```
 
-Open the browser, create the owner account on the setup screen, then either fill in **Settings → Business details** or load demo data (**Settings → Load demo data**, or `npm run db:seed`).
-
-For development with hot reload: `npm run dev`.
+Sign up at `/signup`. Without `SMTP_URL`, reset emails are printed in the terminal. To fill an account with sample data: `npm run db:seed <your email>`, or **Settings → Load demo data**.
 
 ## 2. Configuration
 
-All configuration is in environment variables (`.env` in the project folder, or your process manager). There are **no secret API keys** in this edition.
+All configuration is environment variables; see [`.env.example`](../.env.example) for the full list with comments.
 
-| Variable | Default | Meaning |
+| Variable | Required in production | Meaning |
 | --- | --- | --- |
-| `DATABASE_PATH` | `./data/bizflow.db` | Location of the SQLite file. Keep it outside any publicly served folder. |
-| `COOKIE_SECURE` | `false` | Set to `true` when served over HTTPS so the session cookie is `Secure`. |
-| `SESSION_DAYS` | `14` | How long a login lasts. |
-| `PORT` | `3000` | Port for `npm start` (`next start -p` also works). |
+| `APP_URL` | yes | Public URL, e.g. `https://bizflow.com.bd` |
+| `DATA_DIR` | yes | Where databases live, e.g. `/var/lib/bizflow` |
+| `COOKIE_SECURE` | yes (`true`) | Secure session cookie over HTTPS |
+| `SMTP_URL`, `MAIL_FROM` | yes | Password-reset emails |
+| `SUPPORT_EMAIL`, `LEGAL_ENTITY_NAME` | yes | Shown on billing and legal pages |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | for card payments | [BILLING.md](BILLING.md#stripe) |
+| `BKASH_*` | for bKash payments | [BILLING.md](BILLING.md#bkash) |
+| `TRIAL_DAYS`, `BKASH_PRICE_BDT` | no | Defaults 14 and 600 |
+| `SESSION_DAYS`, `MAX_OPEN_TENANT_DBS` | no | Defaults 14 and 200 |
 
-Business settings (name, language, currency, numbering, taxes) are edited in the app, not in env files.
-
-## 3. Production on a VPS (Ubuntu example)
-
-Typical cost: **US$4–6 per month** for a 1 vCPU / 1 GB VPS (DigitalOcean, Hetzner, Vultr, Linode, or a local Bangladeshi provider). A domain is optional (~US$10–15/year). HTTPS via Let's Encrypt is free.
+## 3. Production on a VPS (Ubuntu)
 
 ```bash
-# as a non-root user with sudo
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs git
-git clone <repo> /opt/bizflow && cd /opt/bizflow
-npm ci && npm run build
+sudo useradd --system --home /var/lib/bizflow bizflow
+sudo mkdir -p /var/lib/bizflow /etc/bizflow && sudo chown bizflow /var/lib/bizflow
+git clone https://github.com/mizan-cdda/bizflow /opt/bizflow && cd /opt/bizflow
+npm ci && npm run build && sudo chown -R bizflow /opt/bizflow
+sudo cp .env.example /etc/bizflow/env && sudo chmod 600 /etc/bizflow/env   # then edit it
 ```
 
-Create `/etc/systemd/system/bizflow.service`:
+`/etc/systemd/system/bizflow.service`:
 
 ```ini
 [Unit]
-Description=BizFlow Kit
+Description=BizFlow
 After=network.target
 
 [Service]
 WorkingDirectory=/opt/bizflow
+EnvironmentFile=/etc/bizflow/env
 Environment=NODE_ENV=production
 Environment=PORT=3000
-Environment=DATABASE_PATH=/var/lib/bizflow/bizflow.db
-Environment=COOKIE_SECURE=true
 ExecStart=/usr/bin/npm start
 Restart=always
 User=bizflow
@@ -72,82 +78,70 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo useradd --system --home /var/lib/bizflow bizflow
-sudo mkdir -p /var/lib/bizflow && sudo chown bizflow /var/lib/bizflow
-sudo chown -R bizflow /opt/bizflow
 sudo systemctl enable --now bizflow
 ```
 
-Put a reverse proxy with HTTPS in front. With Caddy (automatic certificates):
+HTTPS with Caddy (automatic certificates), `/etc/caddy/Caddyfile`:
 
 ```
-invoices.example.com {
+bizflow.example.com {
   reverse_proxy localhost:3000
 }
 ```
 
-Or Nginx + Certbot with `proxy_pass http://127.0.0.1:3000;` and `proxy_set_header X-Forwarded-For $remote_addr;`.
+Caddy sets `X-Forwarded-For`, which the sign-in rate limiter uses. With Nginx, add `proxy_set_header X-Forwarded-For $remote_addr;` and `proxy_set_header X-Forwarded-Proto https;`.
 
-**Always use HTTPS when the app is reachable from the internet** — the login cookie must not travel in plain text.
+Then register the Stripe webhook (`https://<domain>/api/billing/stripe/webhook`) and give bKash your callback domain, as described in [BILLING.md](BILLING.md).
 
-## 4. Running on a shop or office PC (no internet exposure)
-
-Install Node.js 22 from nodejs.org, then run the local install steps. To start automatically on Windows, use Task Scheduler ("At log on" → `npm start` in the project folder) or a tool such as `pm2` (`npm i -g pm2 && pm2 start npm --name bizflow -- start && pm2 save`). Other devices on the same network can open `http://<pc-ip>:3000`.
-
-## 5. Updating
+## 4. Updating
 
 ```bash
-npm run db:backup            # safety copy first
-git pull                     # or unpack the new release
-npm ci && npm run build
+cd /opt/bizflow
+npm run db:backup /var/backups/bizflow
+git pull && npm ci && npm run build
 sudo systemctl restart bizflow
 ```
 
-Database migrations run automatically on start.
+Migrations run automatically when a database is opened. `npm run db:migrate` migrates every database up front if you prefer.
 
-## 6. Backups and data export
+## 5. Backups
 
-Your business data lives in **one file** (`DATABASE_PATH`). Back it up like any important document.
+All customer data is in `DATA_DIR`. Lose it and you lose every customer's business, so back it up off the server.
 
-| Method | How | Use for |
-| --- | --- | --- |
-| In-app JSON backup | Settings → Data & backup → **Download backup** | Quick manual backups; restore through the same screen |
-| CLI file backup | `npm run db:backup [folder]` | Consistent copy of the SQLite file, safe while the app runs |
-| Scheduled | cron: `0 2 * * * cd /opt/bizflow && npm run db:backup /var/backups/bizflow` | Nightly backups |
-| Off-site | copy the backup folder to Google Drive, Dropbox, S3, or a USB disk | Protection against server loss |
-| CSV | Reports → Export data | Opening data in Excel/Sheets, giving data to an accountant |
+```bash
+# nightly at 02:00, keep 30 days
+0 2 * * * cd /opt/bizflow && DATA_DIR=/var/lib/bizflow npm run db:backup /var/backups/bizflow && find /var/backups/bizflow -maxdepth 1 -mtime +30 -exec rm -rf {} +
+```
 
-Recommended: nightly CLI backup, keep 30 days (`find /var/backups/bizflow -mtime +30 -delete`), and copy off-site weekly. Test a restore occasionally.
+`db:backup` writes consistent copies (safe while the app runs) of `control.db` and every tenant file into a timestamped folder. Copy that folder off-site daily (restic, rclone to S3/Backblaze B2, or your provider's snapshots). Test a restore regularly: stop the app, copy the files back into `DATA_DIR`, delete stray `-wal`/`-shm` files, start the app.
 
-To restore a file backup: stop the app, replace the database file with the backup copy (delete any `-wal`/`-shm` files next to it), start the app.
+Customers can also download their own JSON backup and CSV exports from Settings or Billing at any time.
 
-The JSON backup excludes the password hash and sessions; it contains customer data, so store it securely.
+## 6. Security checklist
 
-## 7. Security checklist
+- [ ] HTTPS everywhere, `COOKIE_SECURE=true`
+- [ ] `/etc/bizflow/env` readable only by root/bizflow; no keys in git
+- [ ] `DATA_DIR` and backups readable only by the service user
+- [ ] Firewall: only 80/443 and SSH open; SSH keys only
+- [ ] Unattended OS security updates
+- [ ] Off-site backups, restore tested
+- [ ] Stripe webhook signing secret set; bKash live credentials stored only in the env file
 
-- [ ] Served over HTTPS with `COOKIE_SECURE=true`
-- [ ] Strong owner password (10+ characters)
-- [ ] Database and backup folders readable only by the service user
-- [ ] Server OS updates enabled (`unattended-upgrades`)
-- [ ] Backups copied off the server
-- [ ] Firewall allows only 80/443 (and SSH)
+Built in: scrypt password hashing, hashed session and reset tokens, per-IP rate limits on sign-in, sign-up and reset, a sign-up honeypot, same-origin checks on all form actions (Next.js server actions), security headers, and a separate database per business.
 
-Forgot the password? On the server: `npm run set-password <username> <new-password>` (this also signs out all sessions).
-
-## 8. Command reference
+## 7. Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Development server |
-| `npm run build` / `npm start` | Production build / server |
-| `npm test` | Unit and workflow tests |
-| `npm run typecheck` | TypeScript check |
-| `npm run db:migrate` | Create or upgrade the database without starting the app |
-| `npm run db:seed` | Replace business data with demo data |
-| `npm run db:reset` | Erase all business data (keeps settings and login) |
-| `npm run db:backup [dir]` | Write a consistent copy of the database |
-| `npm run set-password <user> <pw>` | Reset a password, or create the first user |
+| `npm run dev` / `npm run build` / `npm start` | Develop / build / run |
+| `npm test`, `npm run typecheck` | Tests and type check |
+| `npm run db:migrate` | Create or upgrade all databases |
+| `npm run db:backup [dir]` | Consistent copy of every database |
+| `npm run db:accounts` | List accounts with subscription status |
+| `npm run db:seed <email>` | Replace that account's data with demo data |
+| `npm run set-password <email> <pw>` | Reset a user's password |
+| `npm run db:grant <email> <days>` | Extend an account's paid-through date |
 
-## Hosting platforms that are not supported
+## Moving from the self-hosted BizFlow Kit
 
-Serverless platforms with an ephemeral or read-only file system (Vercel, Netlify functions, Cloudflare Workers) cannot keep the SQLite file. Use a VPS, a container with a persistent volume (Railway, Fly.io volumes, Render disks — note these platforms usually charge US$5–10/month), or your own machine.
+The 1.x self-hosted edition (one owner, one `bizflow.db`) remains in git history before version 2.0.0. To move a business onto the hosted service, download a JSON backup in the old app (**Settings → Download backup**), sign up on the hosted site, and restore it under **Settings → Restore from backup**.

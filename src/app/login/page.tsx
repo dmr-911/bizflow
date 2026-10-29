@@ -1,20 +1,38 @@
+import type { Metadata } from "next";
+import Link from "next/link";
 import { redirect } from "next/navigation";
-import { loginAction } from "@/app/actions/auth";
-import { AuthForm } from "@/components/auth-form";
 import { AuthShell } from "@/components/auth-shell";
-import { getDb } from "@/lib/db";
-import { hasUsers } from "@/lib/services/auth";
-import { currentUser, getContext } from "@/lib/server/context";
+import { LoginForm } from "@/components/auth-forms";
+import { getDictionary } from "@/lib/i18n";
+import { currentUser, visitorLocale } from "@/lib/server/context";
 
-export const metadata = { title: "Sign in" };
+export const metadata: Metadata = {
+  title: "Sign in",
+  description: "Sign in to BizFlow to manage your customers, quotations and invoices.",
+  alternates: { canonical: "/login" },
+};
 
-export default async function LoginPage() {
-  if (!hasUsers(getDb())) redirect("/setup");
-  if (await currentUser()) redirect("/");
-  const { t } = await getContext();
+export default async function LoginPage({ searchParams }: { searchParams: Promise<{ next?: string }> }) {
+  if (await currentUser()) redirect("/dashboard");
+  const locale = await visitorLocale();
+  const t = getDictionary(locale);
+  const { next } = await searchParams;
   return (
-    <AuthShell title={t.auth.login} text={t.auth.signInText}>
-      <AuthForm action={loginAction} labels={{ username: t.auth.username, password: t.auth.password, submit: t.auth.login }} />
+    <AuthShell
+      t={t}
+      locale={locale}
+      title={t.auth.loginTitle}
+      text={t.auth.signInText}
+      footer={
+        <>
+          {t.auth.noAccount}{" "}
+          <Link href="/signup" className="font-semibold text-brand-600 hover:text-brand-700">
+            {t.auth.createAccount}
+          </Link>
+        </>
+      }
+    >
+      <LoginForm t={t.auth} next={next?.startsWith("/") && !next.startsWith("//") ? next : undefined} />
     </AuthShell>
   );
 }
