@@ -1,30 +1,4 @@
-/**
- * Postgres schema migrations. Each entry runs once, in order, inside one transaction
- * (see migrate() in ./index). Append new migrations; never edit one that has shipped.
- *
- * Conventions: money columns are BIGINT minor units, quantities are BIGINT
- * thousandths, rates are INTEGER basis points, dates are TEXT 'YYYY-MM-DD',
- * timestamps are TEXT ISO-8601 UTC (the same values the SQLite version stored,
- * so code compares them as strings and backups stay compatible).
- *
- * Tenancy: every business table has account_id, a (account_id, id) primary key and
- * composite foreign keys, so rows can only reference rows of the same business and
- * are removed with their account. ids come from one shared sequence per table; ids
- * restored from a backup or imported from SQLite may repeat across businesses.
- *
- * Needs Postgres 15+ for ON DELETE SET NULL (column). Neon's default is 17.
- */
-export interface Migration {
-  id: number;
-  name: string;
-  sql: string;
-}
-
-export const MIGRATIONS: Migration[] = [
-  {
-    id: 1,
-    name: "accounts, billing and business records",
-    sql: `
+-- The schema BizFlow 2.1 created with its own runner (before Drizzle). Used to test adoption.
 -- ---------- Accounts, logins and billing ----------
 
 CREATE TABLE accounts (
@@ -231,19 +205,3 @@ CREATE TABLE activities (
 );
 CREATE INDEX activities_created ON activities (account_id, created_at DESC);
 CREATE INDEX activities_customer ON activities (account_id, customer_id);
-`,
-  },
-];
-
-/** Tables with an identity id column, for syncSequences after explicit-id inserts. */
-export const ID_TABLES = [
-  "accounts",
-  "users",
-  "billing_payments",
-  "customers",
-  "documents",
-  "document_items",
-  "payments",
-  "follow_ups",
-  "activities",
-] as const;

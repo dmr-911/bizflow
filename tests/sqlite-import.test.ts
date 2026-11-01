@@ -11,7 +11,9 @@ import { getDocument } from "@/lib/services/documents";
 import { listFollowUps } from "@/lib/services/followups";
 import { getSettings } from "@/lib/services/settings";
 import { importSqlite } from "../scripts/sqlite-import";
-import { useTestDatabase } from "./helpers/db";
+import { count, sql } from "drizzle-orm";
+import { accounts } from "@/lib/db/schema";
+import { pgFailure, useTestDatabase } from "./helpers/db";
 
 useTestDatabase();
 
@@ -93,13 +95,13 @@ describe("SQLite import", () => {
     await importSqlite(db, dir);
     await expect(importSqlite(db, dir)).rejects.toThrow(/already has 2 account/);
 
-    await db.run("TRUNCATE accounts, webhook_events RESTART IDENTITY CASCADE");
+    await db.orm.execute(sql`TRUNCATE accounts, webhook_events RESTART IDENTITY CASCADE`);
     // A payment pointing at a missing invoice breaks the foreign key half way through.
     const broken = new Database(path.join(dir, "tenants", "2.db"));
     broken.pragma("foreign_keys = OFF");
     broken.prepare("INSERT INTO payments (invoice_id, amount, paid_at, method, created_at) VALUES (99, 1, '2026-10-03', 'cash', ?)").run(T);
     broken.close();
-    await expect(importSqlite(db, dir)).rejects.toThrow(/foreign key/);
-    expect(await db.get("SELECT COUNT(*)::int AS n FROM accounts")).toEqual({ n: 0 });
+    expect(await pgFailure(importSqlite(db, dir))).toMatch(/foreign key/);
+    expect(await db.orm.select({ n: count() }).from(accounts)).toEqual([{ n: 0 }]);
   });
 });

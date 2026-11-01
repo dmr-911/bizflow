@@ -1,5 +1,6 @@
 import type { TenantDb } from "../db";
 import { withClock } from "../db";
+import { customers as customersTable } from "../db/schema";
 import { addDays, todayIso } from "../dates";
 import { createCustomer, type Customer } from "./customers";
 import { resetBusinessData } from "./data";
@@ -158,7 +159,7 @@ export async function seedDemoData(db: TenantDb, today = todayIso()): Promise<vo
     // Uddin Traders: an old cancelled invoice, then the customer is archived.
     const uInv = await doc("invoice", uddin.id, -150, -136, "BDT", [{ description: "Shop signboard design", quantity: "1", unitPrice: "6000" }]);
     await withClock(at(d(-140)), () => cancelInvoice(db, uInv.id));
-    await db.run("UPDATE customers SET archived_at = $3 WHERE account_id = $1 AND id = $2", db.accountId, uddin.id, at(d(-130)));
+    await db.orm.update(customersTable).set({ archivedAt: at(d(-130)) }).where(db.byId(customersTable, uddin.id));
 
     // Follow-ups: overdue, today, upcoming and done.
     const fu = (title: string, due: number, customerId: number, documentId?: number, note = "") =>

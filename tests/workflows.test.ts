@@ -30,7 +30,9 @@ import {
   sessionUser,
 } from "@/lib/services/auth";
 import { toCsv } from "@/lib/csv";
-import { newTenant, useTestDatabase } from "./helpers/db";
+import { eq, sql } from "drizzle-orm";
+import { documents, users } from "@/lib/db/schema";
+import { newTenant, pgFailure, useTestDatabase } from "./helpers/db";
 
 useTestDatabase();
 
@@ -134,7 +136,7 @@ describe("invoice workflow", () => {
     const b = await createDocument(db, "invoice", docInput(c.id));
     expect(a.number).toBe("INV-2026-0001");
     expect(b.number).toBe("INV-2026-0002");
-    await expect(db.run("UPDATE documents SET number = $2 WHERE account_id = $1 AND id = $3", db.accountId, a.number, b.id)).rejects.toThrow(
+    expect(await pgFailure(db.orm.update(documents).set({ number: a.number }).where(db.byId(documents, b.id)))).toMatch(
       /documents_account_id_kind_number_key/,
     );
   });
@@ -242,6 +244,14 @@ describe("reports", () => {
     expect(active.map((r) => r.customerName).sort()).toEqual(["Farhana Rahman", "Sarah Mitchell"]);
     expect(active.every((r) => r.activityCount === 2)).toBe(true);
     expect(active.find((r) => r.customerName === "Sarah Mitchell")!.received).toEqual({ USD: 223550 });
+
+    // Per-customer counts must not leak between customers (correlated subqueries).
+    await createDocument(db, "quotation", docInput(c2.id));
+    const list = await listCustomers(db);
+    expect(list.map((r) => [r.name, r.invoiceCount, r.quotationCount])).toEqual([
+      ["Farhana Rahman", 1, 0],
+      ["Sarah Mitchell", 1, 1],
+    ]);
   });
 });
 
@@ -252,11 +262,9 @@ describe("demo data, reset and backup", () => {
     expect(before.invoiceCount).toBeGreaterThan(5);
     expect(before.overdueCount).toBeGreaterThan(0);
     // Every stored total matches its lines.
-    const bad = await db.all(
-      `SELECT d.id FROM documents d WHERE d.account_id = $1
-         AND d.total != (SELECT COALESCE(SUM(line_total), 0) FROM document_items i WHERE i.account_id = d.account_id AND i.document_id = d.id)`,
-      db.accountId,
-    );
+    const bad = await db.rows(sql`
+      SELECT d.id FROM documents d WHERE d.account_id = ${db.accountId}
+        AND d.total != (SELECT COALESCE(SUM(line_total), 0) FROM document_items i WHERE i.account_id = d.account_id AND i.document_id = d.id)`);
     expect(bad).toEqual([]);
 
     const backup = JSON.parse(JSON.stringify(await exportBackup(db)));
@@ -282,7 +290,7 @@ describe("auth", () => {
     expect(await authenticate(control, "owner@example.com", "wrong password!")).toBeNull();
     const u = await authenticate(control, " OWNER@example.com ", "correct horse battery");
     expect(u).toMatchObject({ id: userId, accountId, email: "owner@example.com", businessName: "Rahman Textiles" });
-    const { password_hash: hash } = (await control.get<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = $1", userId))!;
+    const [{ hash }] = await control.orm.select({ hash: users.passwordHash }).from(users).where(eq(users.id, userId));
     expect(hash).not.toContain("correct");
     const { token } = await createSession(control, u!.id, 1);
     expect((await sessionUser(control, token))?.accountId).toBe(accountId);

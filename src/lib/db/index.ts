@@ -1,97 +1,96 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import pg from "pg";
-import { MIGRATIONS, type Migration } from "./migrations";
+import { and, eq, sql, type Column, type SQL } from "drizzle-orm";
+import { drizzle, type NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
+import type { PgDatabase } from "drizzle-orm/pg-core";
+import * as schema from "./schema";
+import { runMigrations, type MigrateOptions } from "./migrate";
+
+export { schema };
 
 /*
- * Storage layout: one Postgres database (Neon in production). Accounts, logins
- * and billing are ordinary tables; every business table carries account_id and
- * every business query filters on it. Composite keys (account_id, id) and
- * composite foreign keys mean a row can only ever point at rows of the same
- * business, so one account can never read or link another account's data.
- *
- * Conventions for SQL in the services: `$1` is always the account id in
- * business queries, and camelCase aliases are double-quoted ("customerId").
+ * Storage layout: one Postgres database (Neon in production), accessed through
+ * Drizzle ORM. The tables are declared in ./schema.ts and created by the SQL
+ * migrations in /drizzle. Accounts, logins and billing are ordinary tables; every
+ * business table carries account_id and every business query filters on it
+ * (`db.owns(table)`). Composite keys (account_id, id) and composite foreign keys mean
+ * a row can only ever point at rows of the same business, so one account can never
+ * read or link another account's data.
  */
 
-// COUNT, SUM and BIGINT columns arrive as strings by default. Every value we store
-// fits comfortably in a double (money is minor units, ids are sequence numbers).
+// COUNT, SUM and BIGINT values arrive as strings by default. Every value we store fits
+// comfortably in a double (money is minor units, ids are sequence numbers).
 pg.types.setTypeParser(pg.types.builtins.INT8, (v) => Number(v));
 pg.types.setTypeParser(pg.types.builtins.NUMERIC, (v) => Number(v));
 
-type Conn = pg.Pool | pg.PoolClient;
+/** A Drizzle database or transaction: both run queries the same way. */
+export type Orm = PgDatabase<NodePgQueryResultHKT, typeof schema>;
 
-/** Thin async wrapper over a pool or, inside `tx`, a single transaction's client. */
+type Results<T extends readonly (() => Promise<unknown>)[]> = { -readonly [K in keyof T]: Awaited<ReturnType<T[K]>> };
+
+/** Accounts, logins and billing. `orm` is the Drizzle query builder, bound to a transaction inside `tx`. */
 export class Db {
   constructor(
-    protected readonly conn: Conn,
+    readonly orm: Orm,
     readonly inTransaction = false,
   ) {}
-
-  async all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]> {
-    return (await this.query(sql, params)).rows as T[];
-  }
-
-  async get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined> {
-    return (await this.query(sql, params)).rows[0] as T | undefined;
-  }
-
-  /** Returns the number of rows changed. */
-  async run(sql: string, ...params: unknown[]): Promise<number> {
-    return (await this.query(sql, params)).rowCount ?? 0;
-  }
-
-  // A transaction's client runs one query at a time; queue them so Promise.all inside tx is safe.
-  private queue: Promise<unknown> = Promise.resolve();
-
-  private query(sql: string, params: unknown[]): Promise<pg.QueryResult> {
-    // Ids parsed from URLs and forms can be NaN. Bind those as NULL so they match nothing
-    // (as SQLite did) instead of failing with "invalid input syntax for type bigint".
-    const values = params.map((p) => (typeof p === "number" && !Number.isFinite(p) ? null : p));
-    if (!this.inTransaction) return this.conn.query(sql, values);
-    const result = this.queue.then(() => this.conn.query(sql, values));
-    this.queue = result.catch(() => {});
-    return result;
-  }
 
   /** Run fn in one transaction. Nested calls join the outer transaction. */
   async tx<T>(fn: (db: this) => Promise<T>): Promise<T> {
     if (this.inTransaction) return fn(this);
-    const client = await (this.conn as pg.Pool).connect();
-    try {
-      await client.query("BEGIN");
-      const db = this.bind(client);
+    return this.orm.transaction(async (t) => {
+      const db = this.bind(t);
       await db.onBegin();
-      const result = await fn(db);
-      await client.query("COMMIT");
-      return result;
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+      return fn(db);
+    });
   }
 
-  protected bind(client: pg.PoolClient): this {
-    return new Db(client, true) as this;
+  /**
+   * Run independent reads together. A transaction holds one connection, which runs one
+   * query at a time, so inside `tx` they run in order instead.
+   */
+  async parallel<const T extends readonly (() => Promise<unknown>)[]>(...fns: T): Promise<Results<T>> {
+    if (!this.inTransaction) return (await Promise.all(fns.map((f) => f()))) as Results<T>;
+    const out: unknown[] = [];
+    for (const f of fns) out.push(await f());
+    return out as Results<T>;
+  }
+
+  /** Raw SQL for the few statements the query builder can't express (aggregates, bulk loads, locks). */
+  async rows<T = Record<string, unknown>>(query: SQL): Promise<T[]> {
+    return (await this.orm.execute(query)).rows as T[];
+  }
+
+  protected bind(t: Orm): this {
+    return new Db(t, true) as this;
   }
 
   protected async onBegin(): Promise<void> {}
 }
 
-/** The database as seen by one business. Services must filter every query on `accountId`. */
+/** The database as seen by one business. Every query must filter on `db.owns(table)`. */
 export class TenantDb extends Db {
   constructor(
-    conn: Conn,
+    orm: Orm,
     readonly accountId: number,
     inTransaction = false,
   ) {
-    super(conn, inTransaction);
+    super(orm, inTransaction);
     if (!Number.isSafeInteger(accountId) || accountId <= 0) throw new Error("Invalid account id");
   }
 
-  protected bind(client: pg.PoolClient): this {
-    return new TenantDb(client, this.accountId, true) as this;
+  /** `table.account_id = <this business>` */
+  owns(table: { accountId: Column }): SQL {
+    return eq(table.accountId, this.accountId);
+  }
+
+  /** One row of this business by id. */
+  byId(table: { accountId: Column; id: Column }, id: number): SQL {
+    return and(this.owns(table), idEq(table.id, id))!;
+  }
+
+  protected bind(t: Orm): this {
+    return new TenantDb(t, this.accountId, true) as this;
   }
 
   /**
@@ -100,12 +99,30 @@ export class TenantDb extends Db {
    * when two requests for the same business arrive together. Other businesses are not blocked.
    */
   protected async onBegin(): Promise<void> {
-    await this.conn.query("SELECT pg_advisory_xact_lock($1, $2)", [TENANT_LOCK, this.accountId]);
+    await this.orm.execute(sql`SELECT pg_advisory_xact_lock(${TENANT_LOCK}, ${this.accountId})`);
   }
 }
 
+/**
+ * `column = id`, or false for ids that can't exist. Ids parsed from URLs and forms can be
+ * NaN; Postgres would reject those with "invalid input syntax for type bigint".
+ */
+export function idEq(column: Column, id: number | null | undefined): SQL {
+  return typeof id === "number" && Number.isSafeInteger(id) ? eq(column, id) : sql`false`;
+}
+
 const TENANT_LOCK = 1;
-const MIGRATION_LOCK = 2;
+
+/**
+ * The Postgres error behind a failed query. Drizzle wraps driver errors in
+ * DrizzleQueryError (its message includes the SQL and parameters), with the original as `cause`.
+ */
+export function pgError(e: unknown): { code: string; constraint?: string; message: string } | undefined {
+  for (let err = e; err && typeof err === "object"; err = (err as { cause?: unknown }).cause) {
+    if (typeof (err as { code?: unknown }).code === "string") return err as { code: string; constraint?: string; message: string };
+  }
+  return undefined;
+}
 
 export function databaseUrl(): string {
   const url = process.env.DATABASE_URL;
@@ -137,29 +154,45 @@ export function createPool(connectionString = databaseUrl(), extra: pg.PoolConfi
   return pool;
 }
 
+export function createOrm(pool: pg.Pool): Orm {
+  return drizzle({ client: pool, schema });
+}
+
 // The pool lives for the server process and survives dev hot reloads.
-const globalForDb = globalThis as unknown as { __bizflowPool?: pg.Pool; __bizflowReady?: Promise<void> };
+const globalForDb = globalThis as unknown as {
+  __bizflowPool?: pg.Pool;
+  __bizflowOrm?: Orm;
+  __bizflowReady?: Promise<void>;
+  __bizflowMigrate?: MigrateOptions;
+};
 
 export function getPool(): pg.Pool {
   return (globalForDb.__bizflowPool ??= createPool());
 }
 
+function getOrm(): Orm {
+  return (globalForDb.__bizflowOrm ??= createOrm(getPool()));
+}
+
 /** Use a specific pool, e.g. a per-test schema. Resets the migration check. */
-export function setPool(pool: pg.Pool): void {
+export function setPool(pool: pg.Pool, migrate: MigrateOptions = {}): void {
   globalForDb.__bizflowPool = pool;
+  globalForDb.__bizflowOrm = undefined;
   globalForDb.__bizflowReady = undefined;
+  globalForDb.__bizflowMigrate = migrate;
 }
 
 export async function closePool(): Promise<void> {
   const pool = globalForDb.__bizflowPool;
   globalForDb.__bizflowPool = undefined;
+  globalForDb.__bizflowOrm = undefined;
   globalForDb.__bizflowReady = undefined;
   await pool?.end();
 }
 
 /** Migrates once per process, on first use, so a fresh database just works. */
 function ready(): Promise<void> {
-  return (globalForDb.__bizflowReady ??= migrate(getPool()).then(
+  return (globalForDb.__bizflowReady ??= runMigrations(getPool(), globalForDb.__bizflowMigrate).then(
     () => {},
     (e) => {
       globalForDb.__bizflowReady = undefined;
@@ -171,44 +204,16 @@ function ready(): Promise<void> {
 /** Accounts, logins and billing. */
 export async function getDb(): Promise<Db> {
   await ready();
-  return new Db(getPool());
+  return new Db(getOrm());
 }
 
 /** One business's view of the database. */
 export async function getTenantDb(accountId: number): Promise<TenantDb> {
   await ready();
-  return new TenantDb(getPool(), accountId);
+  return new TenantDb(getOrm(), accountId);
 }
 
-/**
- * Apply pending migrations in one transaction. A transaction-scoped advisory lock
- * makes concurrent cold starts wait for each other, and works through Neon's pooler.
- */
-export async function migrate(pool: pg.Pool, migrations: Migration[] = MIGRATIONS): Promise<number> {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK]);
-    await client.query(
-      `CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`,
-    );
-    const applied = new Set((await client.query<{ id: number }>("SELECT id FROM schema_migrations")).rows.map((r) => r.id));
-    let count = 0;
-    for (const m of migrations) {
-      if (applied.has(m.id)) continue;
-      await client.query(m.sql);
-      await client.query("INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)", [m.id, m.name, new Date().toISOString()]);
-      count++;
-    }
-    await client.query("COMMIT");
-    return count;
-  } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw e;
-  } finally {
-    client.release();
-  }
-}
+export { runMigrations as migrate, type MigrateOptions };
 
 /**
  * After rows were inserted with explicit ids (restore, SQLite import), move each
@@ -216,9 +221,11 @@ export async function migrate(pool: pg.Pool, migrations: Migration[] = MIGRATION
  */
 export async function syncSequences(db: Db, tables: readonly string[]): Promise<void> {
   for (const t of tables) {
-    await db.run(
-      `SELECT setval(s, GREATEST((SELECT COALESCE(MAX(id), 0) FROM ${t}), COALESCE(pg_sequence_last_value(s::regclass), 0), 1))
-       FROM pg_get_serial_sequence('${t}', 'id') AS s`,
+    await db.orm.execute(
+      sql.raw(
+        `SELECT setval(s, GREATEST((SELECT COALESCE(MAX(id), 0) FROM ${t}), COALESCE(pg_sequence_last_value(s::regclass), 0), 1))
+         FROM pg_get_serial_sequence('${t}', 'id') AS s`,
+      ),
     );
   }
 }

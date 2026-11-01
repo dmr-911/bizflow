@@ -1,7 +1,8 @@
 /**
  * Command-line maintenance for the hosted service. Reads DATABASE_URL (from .env too).
  *
- *   npm run db:migrate                      create / upgrade the schema
+ *   npm run db:migrate                      apply pending migrations from ./drizzle
+ *   npm run db:generate                     write a migration after editing src/lib/db/schema.ts (Drizzle Kit)
  *   npm run db:import-sqlite [data-dir]     one-time copy of the old SQLite files (control.db + tenants/*.db)
  *   npm run db:backup [dir]                 a JSON backup per business, restorable from Settings
  *   npm run db:accounts                     list accounts with their subscription state
@@ -11,7 +12,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { closePool, getDb, getPool, getTenantDb, migrate } from "../src/lib/db";
+import { asc, eq, sql } from "drizzle-orm";
+import { closePool, getDb, getPool, getTenantDb, idEq, migrate, pgError } from "../src/lib/db";
+import { accounts, subscriptions, users } from "../src/lib/db/schema";
 import { seedDemoData } from "../src/lib/services/seed";
 import { findUserIdByEmail, setPassword } from "../src/lib/services/auth";
 import { accessState, getSubscription } from "../src/lib/services/billing";
@@ -24,22 +27,20 @@ if (fs.existsSync(".env")) process.loadEnvFile(".env");
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
+  if (cmd === "migrate") {
+    const applied = await migrate(getPool());
+    console.log(applied ? `Applied ${applied} migration(s). Database schema is up to date.` : "Database schema is already up to date.");
+    return;
+  }
   const db = await getDb();
   const accountFor = async (email: string | undefined) => {
     if (!email) throw new Error("Give the account owner's email address");
     const userId = await findUserIdByEmail(db, email);
     if (!userId) throw new Error(`No user with email ${email}`);
-    const { id } = (await db.get<{ id: number }>("SELECT account_id AS id FROM users WHERE id = $1", userId))!;
-    return { userId, accountId: id };
+    const [{ accountId }] = await db.orm.select({ accountId: users.accountId }).from(users).where(eq(users.id, userId));
+    return { userId, accountId };
   };
   switch (cmd) {
-    case "migrate": {
-      // getDb() already applied anything pending; run again to report.
-      const applied = await migrate(getPool());
-      const { n } = (await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM schema_migrations"))!;
-      console.log(`Database schema is up to date (${n} migration(s)${applied ? `, ${applied} just applied` : ""}).`);
-      break;
-    }
     case "import-sqlite": {
       const dir = path.resolve(args[0] ?? process.env.DATA_DIR ?? "data");
       await importSqlite(db, dir, { log: console.log });
@@ -48,19 +49,20 @@ async function main() {
     case "backup": {
       const dir = path.resolve(args[0] ?? "backups", new Date().toISOString().replace(/[:.]/g, "-"));
       fs.mkdirSync(dir, { recursive: true });
-      const accounts = await db.all<{ id: number }>("SELECT id FROM accounts ORDER BY id");
-      for (const { id } of accounts) {
+      const ids = await db.orm.select({ id: accounts.id }).from(accounts).orderBy(asc(accounts.id));
+      for (const { id } of ids) {
         const backup = await exportBackup(await getTenantDb(id));
         fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(backup, null, 2));
       }
-      console.log(`Wrote ${accounts.length} business backup(s) to ${dir}. For a full database copy use pg_dump or a Neon branch.`);
+      console.log(`Wrote ${ids.length} business backup(s) to ${dir}. For a full database copy use pg_dump or a Neon branch.`);
       break;
     }
     case "accounts": {
-      const rows = await db.all<{ id: number; business: string; email: string; created: string }>(
-        `SELECT a.id, a.business_name AS business, u.email, a.created_at AS created FROM accounts a
-         JOIN users u ON u.account_id = a.id AND u.role = 'owner' ORDER BY a.id`,
-      );
+      const rows = await db.orm
+        .select({ id: accounts.id, business: accounts.businessName, email: users.email, created: accounts.createdAt })
+        .from(accounts)
+        .innerJoin(users, sql`${users.accountId} = ${accounts.id} AND ${users.role} = 'owner'`)
+        .orderBy(asc(accounts.id));
       const table = [];
       for (const r of rows) {
         const sub = await getSubscription(db, r.id);
@@ -92,14 +94,14 @@ async function main() {
       const sub = await getSubscription(db, accountId);
       const from = Math.max(Date.now(), sub.currentPeriodEnd ? Date.parse(sub.currentPeriodEnd) : 0);
       const until = new Date(from + days * 86_400_000).toISOString();
-      await db.run(
-        `UPDATE subscriptions SET current_period_end = $1,
-           status = CASE WHEN status = 'canceled' OR status = 'trialing' THEN 'active' ELSE status END, updated_at = $2
-         WHERE account_id = $3`,
-        until,
-        new Date().toISOString(),
-        accountId,
-      );
+      await db.orm
+        .update(subscriptions)
+        .set({
+          currentPeriodEnd: until,
+          status: sql`CASE WHEN ${subscriptions.status} IN ('canceled', 'trialing') THEN 'active' ELSE ${subscriptions.status} END`,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(idEq(subscriptions.accountId, accountId));
       console.log(`Account ${accountId} now has access until ${until}.`);
       break;
     }
@@ -113,7 +115,8 @@ async function main() {
 
 main()
   .catch((e) => {
-    console.error(e instanceof Error ? e.message : e);
+    // Show Postgres's own message, not the failed SQL with all its parameters.
+    console.error(pgError(e)?.message ?? (e instanceof Error ? e.message : e));
     process.exitCode = 1;
   })
   .finally(() => closePool());

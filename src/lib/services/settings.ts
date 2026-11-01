@@ -1,5 +1,7 @@
+import { and, eq } from "drizzle-orm";
 import type { TenantDb } from "../db";
 import { nowIso } from "../db";
+import { settings as settingsTable } from "../db/schema";
 import { settingsSchema, type Settings } from "../validation";
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -31,9 +33,12 @@ export const DEFAULT_SETTINGS: Settings = {
 const KEY = "app";
 
 export async function getSettings(db: TenantDb): Promise<Settings> {
-  const row = await db.get<{ value: Partial<Settings> }>("SELECT value FROM settings WHERE account_id = $1 AND key = $2", db.accountId, KEY);
+  const [row] = await db.orm
+    .select({ value: settingsTable.value })
+    .from(settingsTable)
+    .where(and(db.owns(settingsTable), eq(settingsTable.key, KEY)));
   if (!row) return structuredClone(DEFAULT_SETTINGS);
-  const stored = row.value;
+  const stored = row.value as Partial<Settings>;
   const merged = {
     ...DEFAULT_SETTINGS,
     ...stored,
@@ -49,14 +54,11 @@ export async function saveSettings(db: TenantDb, settings: Settings): Promise<Se
   if (valid.taxRates.length > 0 && defaults.length !== 1) {
     valid.taxRates = valid.taxRates.map((t, i) => ({ ...t, isDefault: i === 0 }));
   }
-  await db.run(
-    `INSERT INTO settings (account_id, key, value, updated_at) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (account_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    db.accountId,
-    KEY,
-    JSON.stringify(valid),
-    nowIso(),
-  );
+  const updatedAt = nowIso();
+  await db.orm
+    .insert(settingsTable)
+    .values({ accountId: db.accountId, key: KEY, value: valid, updatedAt })
+    .onConflictDoUpdate({ target: [settingsTable.accountId, settingsTable.key], set: { value: valid, updatedAt } });
   return valid;
 }
 

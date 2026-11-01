@@ -204,7 +204,9 @@ The `db:*` commands read `DATABASE_URL` from the environment or from `.env`.
 | --- | --- |
 | `npm run dev` / `npm run build` / `npm start` | Develop / build / run |
 | `npm test`, `npm run typecheck` | Tests and type check |
-| `npm run db:migrate` | Create or upgrade the schema |
+| `npm run db:migrate` | Create or upgrade the schema (applies `drizzle/*.sql`) |
+| `npm run db:generate` | After editing `src/lib/db/schema.ts`: write the migration (see [DATABASE.md](DATABASE.md#migrations)) |
+| `npm run db:studio` | Browse the tables with Drizzle Studio |
 | `npm run db:import-sqlite [data-dir]` | One-time copy of the old SQLite files into Postgres |
 | `npm run db:backup [dir]` | One JSON backup file per business |
 | `npm run db:accounts` | List accounts with subscription status |

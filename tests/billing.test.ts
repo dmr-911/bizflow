@@ -20,7 +20,8 @@ import { createDocument, getDocument, listDocuments, markInvoiceSent, recordPaym
 import { createFollowUp } from "@/lib/services/followups";
 import { dashboardStats } from "@/lib/services/reports";
 import { seedDemoData } from "@/lib/services/seed";
-import { useTestDatabase } from "./helpers/db";
+import { pgFailure, useTestDatabase } from "./helpers/db";
+import { documents, followUps } from "@/lib/db/schema";
 
 useTestDatabase();
 
@@ -217,13 +218,11 @@ describe("tenant isolation", () => {
     await expect(createDocument(one, "invoice", docInput(theirs.id))).rejects.toThrow(/Customer not found/);
     await expect(createFollowUp(one, { title: "Call", dueDate: "2026-11-01", customerId: theirs.id })).rejects.toThrow(/not found/);
     // The composite foreign key is the last line of defence.
-    await expect(
-      one.run(
-        `INSERT INTO follow_ups (account_id, title, due_date, customer_id, created_at) VALUES ($1, 'x', '2026-11-01', $2, 'now')`,
-        one.accountId,
-        theirs.id,
+    expect(
+      await pgFailure(
+        one.orm.insert(followUps).values({ accountId: one.accountId, title: "x", dueDate: "2026-11-01", customerId: theirs.id, createdAt: "now" }),
       ),
-    ).rejects.toThrow(/foreign key/);
+    ).toMatch(/foreign key/);
   });
 
   it("restores a backup into another business without touching the first", async () => {
@@ -245,8 +244,8 @@ describe("tenant isolation", () => {
     await seedDemoData(one, "2026-10-29");
     await seedDemoData(two, "2026-10-29");
     await deleteAccount(control, accountId);
-    const left = await control.all<{ account_id: number }>("SELECT DISTINCT account_id FROM documents");
-    expect(left).toEqual([{ account_id: otherId }]);
+    const left = await control.orm.selectDistinct({ accountId: documents.accountId }).from(documents);
+    expect(left).toEqual([{ accountId: otherId }]);
     expect((await listDocuments(two, "invoice")).length).toBeGreaterThan(0);
   });
 

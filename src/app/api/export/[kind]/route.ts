@@ -3,7 +3,7 @@ import { minorToDecimalString } from "@/lib/money";
 import { todayIso } from "@/lib/dates";
 import { toCsv } from "@/lib/csv";
 import { listCustomers } from "@/lib/services/customers";
-import { listDocuments } from "@/lib/services/documents";
+import { listDocuments, paymentLedger } from "@/lib/services/documents";
 import { listFollowUps } from "@/lib/services/followups";
 import { mostActiveCustomers, outstandingBalances, revenueByMonth } from "@/lib/services/reports";
 import { getSettings } from "@/lib/services/settings";
@@ -37,18 +37,10 @@ async function build(db: TenantDb, kind: string, url: URL): Promise<{ header: st
       };
     }
     case "payments": {
-      const rows = await db.all<{ paid_at: string; number: string; name: string; currency: Currency; amount: number; method: string; reference: string; note: string }>(
-        `SELECT p.paid_at, d.number, c.name, d.currency, p.amount, p.method, p.reference, p.note
-         FROM payments p
-         JOIN documents d ON d.account_id = p.account_id AND d.id = p.invoice_id
-         JOIN customers c ON c.account_id = d.account_id AND c.id = d.customer_id
-         WHERE p.account_id = $1
-         ORDER BY p.paid_at, p.id`,
-        db.accountId,
-      );
+      const rows = await paymentLedger(db);
       return {
         header: ["paid_at", "invoice", "customer", "currency", "amount", "method", "reference", "note"],
-        rows: rows.map((r) => [r.paid_at, r.number, r.name, r.currency, m(r.amount, r.currency), r.method, r.reference, r.note]),
+        rows: rows.map((r) => [r.paidAt, r.number, r.customerName, r.currency, m(r.amount, r.currency), r.method, r.reference, r.note]),
       };
     }
     case "follow-ups":

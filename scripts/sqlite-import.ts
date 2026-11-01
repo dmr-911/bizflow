@@ -13,14 +13,33 @@
 import fs from "node:fs";
 import path from "node:path";
 import type BetterSqlite3 from "better-sqlite3";
+import { count, eq, sql } from "drizzle-orm";
+import type { PgTable } from "drizzle-orm/pg-core";
 import { syncSequences, type Db } from "../src/lib/db";
-import { ID_TABLES } from "../src/lib/db/migrations";
+import * as schema from "../src/lib/db/schema";
+import { insertJsonRows, tableColumns } from "../src/lib/services/data";
 
 type Row = Record<string, unknown>;
 
-const CONTROL_TABLES = ["accounts", "users", "sessions", "password_resets", "subscriptions", "billing_payments", "webhook_events"] as const;
+const CONTROL_TABLES = {
+  accounts: schema.accounts,
+  users: schema.users,
+  sessions: schema.sessions,
+  password_resets: schema.passwordResets,
+  subscriptions: schema.subscriptions,
+  billing_payments: schema.billingPayments,
+  webhook_events: schema.webhookEvents,
+};
 // Parents before children. documents.source_document_id is linked in a second pass.
-const BUSINESS_TABLES = ["settings", "customers", "documents", "document_items", "payments", "follow_ups", "activities"] as const;
+const BUSINESS_TABLES = {
+  settings: schema.settings,
+  customers: schema.customers,
+  documents: schema.documents,
+  document_items: schema.documentItems,
+  payments: schema.payments,
+  follow_ups: schema.followUps,
+  activities: schema.activities,
+};
 const CHUNK = 1000;
 
 /** Values SQLite stores differently from the Postgres schema. */
@@ -39,29 +58,14 @@ function convert(table: string, row: Row): Row {
   }
 }
 
-async function columnsOf(db: Db, table: string): Promise<Set<string>> {
-  const rows = await db.all<{ name: string }>(
-    "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1",
-    table,
-  );
-  return new Set(rows.map((r) => r.name));
-}
-
-/** Bulk insert: Postgres turns each chunk of JSON rows into typed records. Business rows get `accountId`. */
-async function insertRows(db: Db, table: string, rows: Row[], accountId?: number): Promise<void> {
+/** Bulk insert in chunks. Business rows get `accountId`. */
+async function insertRows(db: Db, name: string, table: PgTable, rows: Row[], accountId?: number): Promise<void> {
   if (rows.length === 0) return;
-  const target = await columnsOf(db, table);
-  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((c) => target.has(c) && c !== "account_id");
-  if (target.has("account_id") && accountId === undefined) cols.unshift("account_id");
-  const into = accountId === undefined ? cols : ["account_id", ...cols];
-  const select = accountId === undefined ? cols : ["$2::bigint", ...cols];
+  const target = tableColumns(table);
+  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((c) => target.has(c) && (accountId === undefined || c !== "account_id"));
   for (let i = 0; i < rows.length; i += CHUNK) {
-    const chunk = rows.slice(i, i + CHUNK).map((r) => convert(table, r));
-    await db.run(
-      `INSERT INTO ${table} (${into.join(", ")}) SELECT ${select.join(", ")} FROM jsonb_populate_recordset(NULL::${table}, $1::jsonb)`,
-      JSON.stringify(chunk),
-      ...(accountId === undefined ? [] : [accountId]),
-    );
+    const chunk = rows.slice(i, i + CHUNK).map((r) => convert(name, r));
+    await insertJsonRows(db, name, cols, chunk, { accountId });
   }
 }
 
@@ -77,23 +81,23 @@ export async function importSqlite(db: Db, dataDir: string, opts: { log?: (msg: 
   };
 
   return db.tx(async (db) => {
-    const { n } = (await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM accounts"))!;
+    const [{ n }] = await db.orm.select({ n: count() }).from(schema.accounts);
     if (n > 0) throw new Error(`The target database already has ${n} account(s). Import into an empty database (a fresh Neon branch works well).`);
 
     const control = open(controlFile);
-    const expected: { table: string; accountId?: number; count: number }[] = [];
+    const expected: { table: PgTable; name: string; accountId?: number; count: number }[] = [];
     try {
-      for (const t of CONTROL_TABLES) {
+      for (const [t, table] of Object.entries(CONTROL_TABLES)) {
         const rows = read(control, t);
-        await insertRows(db, t, rows);
-        expected.push({ table: t, count: rows.length });
+        await insertRows(db, t, table, rows);
+        expected.push({ table, name: t, count: rows.length });
         log(`  ${t}: ${rows.length}`);
       }
     } finally {
       control.close();
     }
 
-    const accountIds = new Set((await db.all<{ id: number }>("SELECT id FROM accounts")).map((r) => r.id));
+    const accountIds = new Set((await db.orm.select({ id: schema.accounts.id }).from(schema.accounts)).map((r) => r.id));
     const tenantDir = path.join(dataDir, "tenants");
     const files = fs.existsSync(tenantDir) ? fs.readdirSync(tenantDir).filter((f) => /^\d+\.db$/.test(f)) : [];
     let businesses = 0;
@@ -106,21 +110,19 @@ export async function importSqlite(db: Db, dataDir: string, opts: { log?: (msg: 
       const sqlite = open(path.join(tenantDir, file));
       try {
         const counts: string[] = [];
-        for (const t of BUSINESS_TABLES) {
+        for (const [t, table] of Object.entries(BUSINESS_TABLES)) {
           const rows = read(sqlite, t);
-          await insertRows(db, t, rows, accountId);
-          expected.push({ table: t, accountId, count: rows.length });
+          await insertRows(db, t, table, rows, accountId);
+          expected.push({ table, name: t, accountId, count: rows.length });
           counts.push(`${t} ${rows.length}`);
           if (t === "documents") {
             const links = rows.filter((r) => r.source_document_id).map((r) => ({ id: r.id, source: r.source_document_id }));
             if (links.length) {
-              await db.run(
-                `UPDATE documents d SET source_document_id = l.source
-                 FROM jsonb_to_recordset($2::jsonb) AS l(id BIGINT, source BIGINT)
-                 WHERE d.account_id = $1 AND d.id = l.id`,
-                accountId,
-                JSON.stringify(links),
-              );
+              const d = schema.documents;
+              await db.orm.execute(sql`
+                UPDATE ${d} SET source_document_id = l.source
+                FROM jsonb_to_recordset(${JSON.stringify(links)}::jsonb) AS l(id BIGINT, source BIGINT)
+                WHERE ${d.accountId} = ${accountId} AND ${d.id} = l.id`);
             }
           }
         }
@@ -133,11 +135,11 @@ export async function importSqlite(db: Db, dataDir: string, opts: { log?: (msg: 
 
     // Verify before committing.
     for (const e of expected) {
-      const where = e.accountId !== undefined ? "WHERE account_id = $1" : "";
-      const { n: got } = (await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${e.table} ${where}`, ...(e.accountId !== undefined ? [e.accountId] : [])))!;
-      if (got !== e.count) throw new Error(`Row count mismatch for ${e.table}${e.accountId ? ` (business ${e.accountId})` : ""}: SQLite ${e.count}, Postgres ${got}`);
+      const owned = e.accountId !== undefined ? eq((e.table as typeof schema.customers).accountId, e.accountId) : undefined;
+      const [{ n: got }] = await db.orm.select({ n: count() }).from(e.table).where(owned);
+      if (got !== e.count) throw new Error(`Row count mismatch for ${e.name}${e.accountId ? ` (business ${e.accountId})` : ""}: SQLite ${e.count}, Postgres ${got}`);
     }
-    await syncSequences(db, ID_TABLES);
+    await syncSequences(db, schema.ID_TABLES);
     log(`Imported ${accountIds.size} account(s) and ${businesses} business database(s). Row counts verified.`);
     return { accounts: accountIds.size, businesses };
   });

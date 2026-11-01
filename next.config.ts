@@ -9,6 +9,8 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // The server applies pending SQL migrations on first use, so ship them with every function.
+  outputFileTracingIncludes: { "/**": ["./drizzle/**/*"] },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },

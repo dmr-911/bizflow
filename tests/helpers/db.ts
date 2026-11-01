@@ -1,12 +1,14 @@
 import crypto from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach } from "vitest";
-import { closePool, createPool, getDb, getTenantDb, migrate, setPool, type Db, type TenantDb } from "@/lib/db";
+import { sql } from "drizzle-orm";
+import { closePool, createPool, getDb, getTenantDb, migrate, pgError, setPool, type TenantDb } from "@/lib/db";
+import { accounts } from "@/lib/db/schema";
 
 /**
  * Tests run against a real Postgres. Each test file gets its own schema, created
- * and migrated before its tests and dropped afterwards, so files can run in parallel
- * and nothing outside that schema is touched.
+ * and migrated (with the real migrations in /drizzle) before its tests and dropped
+ * afterwards, so files can run in parallel and nothing outside that schema is touched.
  *
  *   TEST_DATABASE_URL=postgres://postgres@localhost:5432/bizflow_test npm test
  */
@@ -21,14 +23,15 @@ export function useTestDatabase() {
     await admin.connect();
     await admin.query(`CREATE SCHEMA ${schema}`);
     const pool = createPool(TEST_DATABASE_URL, { options: `-c search_path=${schema}` });
-    await migrate(pool);
-    setPool(pool);
+    // The migration bookkeeping table goes in the same schema, so it is dropped with it.
+    await migrate(pool, { migrationsSchema: schema });
+    setPool(pool, { migrationsSchema: schema });
   });
 
   beforeEach(async () => {
     const db = await getDb();
     // Truncating accounts cascades to every table that references it.
-    await db.run("TRUNCATE accounts, webhook_events RESTART IDENTITY CASCADE");
+    await db.orm.execute(sql`TRUNCATE accounts, webhook_events RESTART IDENTITY CASCADE`);
   });
 
   afterAll(async () => {
@@ -38,13 +41,21 @@ export function useTestDatabase() {
   });
 }
 
+/** Postgres's own error message for a query that must fail (Drizzle wraps it). */
+export async function pgFailure(p: Promise<unknown>): Promise<string> {
+  try {
+    await p;
+  } catch (e) {
+    const pg = pgError(e);
+    if (pg) return pg.message;
+    throw e;
+  }
+  throw new Error("Expected the query to fail");
+}
+
 /** A bare account to hang business records on. */
 export async function newTenant(name = "Test Business"): Promise<TenantDb> {
-  const db: Db = await getDb();
-  const { id } = (await db.get<{ id: number }>(
-    "INSERT INTO accounts (business_name, created_at) VALUES ($1, $2) RETURNING id",
-    name,
-    new Date().toISOString(),
-  ))!;
+  const db = await getDb();
+  const [{ id }] = await db.orm.insert(accounts).values({ businessName: name, createdAt: new Date().toISOString() }).returning({ id: accounts.id });
   return getTenantDb(id);
 }
