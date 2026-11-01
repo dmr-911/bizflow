@@ -13,12 +13,15 @@ export const metadata = { title: "Dashboard" };
 export default async function DashboardPage({ searchParams }: { searchParams: Promise<{ demo?: string; welcome?: string }> }) {
   const { db, settings, t, fmt } = await pageContext();
   const sp = await searchParams;
-  const stats = dashboardStats(db);
   const cur = settings.defaultCurrency;
-  const months = revenueByMonth(db, { months: 6, currency: cur });
-  const activity = recentActivity(db, { limit: 8 });
-  const followUps = upcomingFollowUps(db, 7).slice(0, 6);
-  const reminders = reminderCounts(db);
+  const [stats, months, activity, upcoming, reminders] = await Promise.all([
+    dashboardStats(db),
+    revenueByMonth(db, { months: 6, currency: cur }),
+    recentActivity(db, { limit: 8 }),
+    upcomingFollowUps(db, 7),
+    reminderCounts(db),
+  ]);
+  const followUps = upcoming.slice(0, 6);
   const isEmpty = stats.invoiceCount === 0 && stats.quotationCount === 0 && activity.length === 0;
 
   return (

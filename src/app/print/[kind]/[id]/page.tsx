@@ -8,7 +8,7 @@ import { pageContext } from "@/lib/server/context";
 
 export async function generateMetadata({ params }: { params: Promise<{ kind: string; id: string }> }) {
   const { db } = await pageContext();
-  const doc = getDocument(db, Number((await params).id));
+  const doc = await getDocument(db, Number((await params).id));
   // The title becomes the default PDF file name in most browsers.
   return { title: { absolute: doc ? `${doc.number} - ${doc.customerName}` : "Print" } };
 }
@@ -16,9 +16,9 @@ export async function generateMetadata({ params }: { params: Promise<{ kind: str
 export default async function PrintPage({ params, searchParams }: { params: Promise<{ kind: string; id: string }>; searchParams: Promise<{ auto?: string }> }) {
   const { db, t, fmt, settings } = await pageContext();
   const { kind, id } = await params;
-  const doc = getDocument(db, Number(id));
+  const doc = await getDocument(db, Number(id));
   if (!doc || doc.kind !== kind) notFound();
-  const customer = getCustomer(db, doc.customerId)!;
+  const customer = (await getCustomer(db, doc.customerId))!;
   const back = `/${doc.kind === "invoice" ? "invoices" : "quotations"}/${doc.id}`;
   return (
     <div className="min-h-screen bg-slate-100 px-2 py-6 print:bg-white print:p-0 sm:px-4">

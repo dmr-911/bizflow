@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
-import type { DB } from "../db";
-import { nowIso } from "../db";
+import { and, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
+import type { Db } from "../db";
+import { idEq, nowIso, pgError } from "../db";
+import { accounts, passwordResets, sessions, subscriptions, users } from "../db/schema";
 
 const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
 
@@ -41,65 +43,79 @@ export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 /**
  * Create a business account with its owner login and a trial subscription.
- * The business database itself is created lazily on first use.
+ * Business settings start from defaults until first saved.
  */
-export function createAccount(
-  db: DB,
+export async function createAccount(
+  db: Db,
   input: { name: string; businessName: string; email: string; password: string },
   opts: { trialDays: number },
-): { accountId: number; userId: number } {
+): Promise<{ accountId: number; userId: number }> {
   const hash = hashPassword(input.password);
-  return db.transaction(() => {
-    const email = normalizeEmail(input.email);
-    if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email)) throw new EmailTakenError();
-    const now = nowIso();
-    const accountId = Number(
-      db.prepare("INSERT INTO accounts (business_name, created_at) VALUES (?, ?)").run(input.businessName, now).lastInsertRowid,
-    );
-    const userId = Number(
-      db
-        .prepare("INSERT INTO users (account_id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(accountId, input.name, email, hash, now).lastInsertRowid,
-    );
-    const trialEnds = new Date(Date.parse(now) + Math.max(0, opts.trialDays) * 86_400_000).toISOString();
-    db.prepare("INSERT INTO subscriptions (account_id, status, trial_ends_at, updated_at) VALUES (?, 'trialing', ?, ?)").run(
-      accountId,
-      trialEnds,
-      now,
-    );
-    return { accountId, userId };
-  })();
+  const email = normalizeEmail(input.email);
+  try {
+    return await db.tx(async (db) => {
+      if (await findUserIdByEmail(db, email)) throw new EmailTakenError();
+      const now = nowIso();
+      const [{ id: accountId }] = await db.orm
+        .insert(accounts)
+        .values({ businessName: input.businessName, createdAt: now })
+        .returning({ id: accounts.id });
+      const [{ id: userId }] = await db.orm
+        .insert(users)
+        .values({ accountId, name: input.name, email, passwordHash: hash, createdAt: now })
+        .returning({ id: users.id });
+      const trialEnds = new Date(Date.parse(now) + Math.max(0, opts.trialDays) * 86_400_000).toISOString();
+      await db.orm.insert(subscriptions).values({ accountId, status: "trialing", trialEndsAt: trialEnds, updatedAt: now });
+      return { accountId, userId };
+    });
+  } catch (e) {
+    // Two signups with the same email at the same moment: the unique index decides.
+    const pg = pgError(e);
+    if (pg?.code === "23505" && pg.constraint === "users_email") throw new EmailTakenError();
+    throw e;
+  }
 }
 
 /** Set a new password and sign out every existing session for that user. */
-export function setPassword(db: DB, userId: number, password: string): boolean {
+export async function setPassword(db: Db, userId: number, password: string): Promise<boolean> {
   const hash = hashPassword(password);
-  return db.transaction(() => {
-    const res = db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hash, userId);
-    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
-    return res.changes > 0;
-  })();
+  return db.tx(async (db) => {
+    const { rowCount } = await db.orm.update(users).set({ passwordHash: hash }).where(idEq(users.id, userId));
+    await db.orm.delete(sessions).where(idEq(sessions.userId, userId));
+    return !!rowCount;
+  });
 }
 
-export function findUserIdByEmail(db: DB, email: string): number | null {
-  const row = db.prepare("SELECT id FROM users WHERE email = ?").get(normalizeEmail(email)) as { id: number } | undefined;
+/** Matches the users_email unique index on lower(email). */
+const byEmail = (email: string) => eq(sql`lower(${users.email})`, normalizeEmail(email));
+
+export async function findUserIdByEmail(db: Db, email: string): Promise<number | null> {
+  const [row] = await db.orm.select({ id: users.id }).from(users).where(byEmail(email));
   return row?.id ?? null;
 }
 
-export function checkPassword(db: DB, userId: number, password: string): boolean {
-  const row = db.prepare("SELECT password_hash AS hash FROM users WHERE id = ?").get(userId) as { hash: string } | undefined;
+export async function checkPassword(db: Db, userId: number, password: string): Promise<boolean> {
+  const [row] = await db.orm.select({ hash: users.passwordHash }).from(users).where(idEq(users.id, userId));
   return verifyPassword(password, row?.hash ?? DUMMY_HASH) && !!row;
 }
 
 // A fixed dummy hash keeps timing similar whether or not the username exists.
 const DUMMY_HASH = hashPassword(crypto.randomBytes(16).toString("hex"));
 
-const USER_COLUMNS = `u.id, u.name, u.email, u.account_id AS accountId, a.business_name AS businessName`;
+const userColumns = {
+  id: users.id,
+  name: users.name,
+  email: users.email,
+  accountId: users.accountId,
+  businessName: accounts.businessName,
+};
 
-export function authenticate(db: DB, email: string, password: string): SessionUser | null {
-  const user = db
-    .prepare(`SELECT ${USER_COLUMNS}, u.password_hash AS hash FROM users u JOIN accounts a ON a.id = u.account_id WHERE u.email = ?`)
-    .get(normalizeEmail(email)) as (SessionUser & { hash: string }) | undefined;
+export async function authenticate(db: Db, email: string, password: string): Promise<SessionUser | null> {
+  const [user] = await db.orm
+    .select({ ...userColumns, hash: users.passwordHash })
+    .from(users)
+    .innerJoin(accounts, eq(accounts.id, users.accountId))
+    .where(byEmail(email));
   const ok = verifyPassword(password, user?.hash ?? DUMMY_HASH);
   if (!user || !ok) return null;
   const { hash: _hash, ...rest } = user;
@@ -109,74 +125,74 @@ export function authenticate(db: DB, email: string, password: string): SessionUs
 const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 
 /** Returns the raw token for the cookie; only its hash is stored. */
-export function createSession(db: DB, userId: number, days: number): { token: string; expiresAt: Date } {
+export async function createSession(db: Db, userId: number, days: number): Promise<{ token: string; expiresAt: Date }> {
   const token = crypto.randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + days * 86_400_000);
-  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(nowIso());
-  db.prepare("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)").run(
-    sha256(token),
-    userId,
-    expiresAt.toISOString(),
-    nowIso(),
-  );
+  await db.orm.delete(sessions).where(lt(sessions.expiresAt, nowIso()));
+  await db.orm.insert(sessions).values({ id: sha256(token), userId, expiresAt: expiresAt.toISOString(), createdAt: nowIso() });
   return { token, expiresAt };
 }
 
-export function sessionUser(db: DB, token: string | undefined): SessionUser | null {
+export async function sessionUser(db: Db, token: string | undefined): Promise<SessionUser | null> {
   if (!token) return null;
-  const row = db
-    .prepare(
-      `SELECT ${USER_COLUMNS} FROM sessions s JOIN users u ON u.id = s.user_id JOIN accounts a ON a.id = u.account_id
-       WHERE s.id = ? AND s.expires_at > ?`,
-    )
-    .get(sha256(token), nowIso()) as SessionUser | undefined;
+  const [row] = await db.orm
+    .select(userColumns)
+    .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.userId))
+    .innerJoin(accounts, eq(accounts.id, users.accountId))
+    .where(and(eq(sessions.id, sha256(token)), gt(sessions.expiresAt, nowIso())));
   return row ?? null;
 }
 
-export function deleteSession(db: DB, token: string | undefined): void {
-  if (token) db.prepare("DELETE FROM sessions WHERE id = ?").run(sha256(token));
+export async function deleteSession(db: Db, token: string | undefined): Promise<void> {
+  if (token) await db.orm.delete(sessions).where(eq(sessions.id, sha256(token)));
 }
 
 const RESET_MINUTES = 60;
 
 /** Returns a one-time reset token to email, or null when no such user exists. */
-export function createPasswordReset(db: DB, email: string): string | null {
-  const userId = findUserIdByEmail(db, email);
+export async function createPasswordReset(db: Db, email: string): Promise<string | null> {
+  const userId = await findUserIdByEmail(db, email);
   if (!userId) return null;
   const token = crypto.randomBytes(32).toString("base64url");
   const now = nowIso();
-  db.transaction(() => {
-    db.prepare("DELETE FROM password_resets WHERE user_id = ? OR expires_at < ?").run(userId, now);
-    db.prepare("INSERT INTO password_resets (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)").run(
-      sha256(token),
+  await db.tx(async (db) => {
+    await db.orm.delete(passwordResets).where(or(eq(passwordResets.userId, userId), lt(passwordResets.expiresAt, now)));
+    await db.orm.insert(passwordResets).values({
+      id: sha256(token),
       userId,
-      new Date(Date.parse(now) + RESET_MINUTES * 60_000).toISOString(),
-      now,
-    );
-  })();
+      expiresAt: new Date(Date.parse(now) + RESET_MINUTES * 60_000).toISOString(),
+      createdAt: now,
+    });
+  });
   return token;
 }
 
-export function isResetTokenValid(db: DB, token: string): boolean {
-  return !!db
-    .prepare("SELECT 1 FROM password_resets WHERE id = ? AND used_at IS NULL AND expires_at > ?")
-    .get(sha256(token), nowIso());
+const usableReset = (token: string, now: string) =>
+  and(eq(passwordResets.id, sha256(token)), isNull(passwordResets.usedAt), gt(passwordResets.expiresAt, now));
+
+export async function isResetTokenValid(db: Db, token: string): Promise<boolean> {
+  const [row] = await db.orm.select({ id: passwordResets.id }).from(passwordResets).where(usableReset(token, nowIso()));
+  return !!row;
 }
 
 /** Use a reset token once. Returns the user id on success. */
-export function resetPassword(db: DB, token: string, password: string): number | null {
-  return db.transaction(() => {
-    const row = db
-      .prepare("SELECT user_id AS userId FROM password_resets WHERE id = ? AND used_at IS NULL AND expires_at > ?")
-      .get(sha256(token), nowIso()) as { userId: number } | undefined;
+export async function resetPassword(db: Db, token: string, password: string): Promise<number | null> {
+  return db.tx(async (db) => {
+    // Marking it used first, with a row lock, means two simultaneous submits cannot both succeed.
+    const now = nowIso();
+    const [row] = await db.orm
+      .update(passwordResets)
+      .set({ usedAt: now })
+      .where(usableReset(token, now))
+      .returning({ userId: passwordResets.userId });
     if (!row) return null;
-    db.prepare("UPDATE password_resets SET used_at = ? WHERE id = ?").run(nowIso(), sha256(token));
-    setPassword(db, row.userId, password);
+    await setPassword(db, row.userId, password);
     return row.userId;
-  })();
+  });
 }
 
-/** Remove an account, its logins and billing records. The caller deletes the business database file. */
-export function deleteAccount(db: DB, accountId: number): void {
-  db.prepare("DELETE FROM accounts WHERE id = ?").run(accountId);
+/** Remove an account with its logins, billing records and every business record (ON DELETE CASCADE). */
+export async function deleteAccount(db: Db, accountId: number): Promise<void> {
+  await db.orm.delete(accounts).where(idEq(accounts.id, accountId));
 }

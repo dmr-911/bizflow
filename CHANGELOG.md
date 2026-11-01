@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.1.0 — unreleased
+
+Storage moves from SQLite files to one PostgreSQL database (Neon serverless Postgres in production), so BizFlow can run on Vercel and on more than one server.
+
+- One shared database: every business table has `account_id`, `(account_id, id)` keys and composite foreign keys; every query is scoped to the signed-in business; deleting an account cascades
+- Writes for one business are serialised with a transaction-scoped advisory lock, so document numbers and payment totals stay correct under concurrent requests
+- Database access through Drizzle ORM: the schema is declared once in `src/lib/db/schema.ts` and queries are type-checked against it; tenant filters are `db.owns(table)` / `db.byId(table, id)`
+- `DATABASE_URL` replaces `DATA_DIR`; Drizzle Kit generates the SQL migrations (`npm run db:generate`), which run automatically behind an advisory lock (safe across serverless instances) or with `npm run db:migrate`; CI checks the schema and migrations agree (`npm run db:check`)
+- Databases created by the first 2.1 preview (hand-written migration runner) are adopted as-is on first start
+- `npm run db:import-sqlite [data-dir]`: one-time, all-or-nothing copy of `control.db` and every `tenants/<id>.db`, keeping ids and verifying row counts
+- `npm run db:backup` now writes one JSON backup per business; database-level backups use Neon history and `pg_dump`
+- JSON backups keep the same format, so files from 2.0 restore unchanged
+- Duplicate document numbers are reported to the user again ("That number is already in use") instead of a generic error
+- `vercel.json` (Singapore region), CI runs tests against Postgres 17, docs for Neon setup, Vercel deployment, free-tier limits and cost
+
 ## 2.0.0 — 2026-10-29
 
 BizFlow becomes a hosted subscription service.

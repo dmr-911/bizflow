@@ -1,7 +1,7 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { getControlDb } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { bkashConfig, BkashError, createPayment } from "@/lib/billing/bkash";
 import { stripeClient, stripeLineItem } from "@/lib/billing/stripe";
 import { createPendingBkashPayment, getSubscription, PLAN, setStripeCustomer } from "@/lib/services/billing";
@@ -15,8 +15,8 @@ export async function startStripeCheckoutAction() {
   const user = await requireUser();
   const stripe = stripeClient();
   if (!stripe) redirect("/billing?error=stripe_unavailable");
-  const db = getControlDb();
-  const sub = getSubscription(db, user.accountId);
+  const db = await getDb();
+  const sub = await getSubscription(db, user.accountId);
   if (sub.stripeSubscriptionId && sub.status !== "canceled") redirect("/billing?error=already_subscribed");
   const base = await appUrl();
 
@@ -28,7 +28,7 @@ export async function startStripeCheckoutAction() {
       metadata: { account_id: String(user.accountId) },
     });
     customerId = customer.id;
-    setStripeCustomer(db, user.accountId, customerId);
+    await setStripeCustomer(db, user.accountId, customerId);
   }
 
   // Subscribing during the free trial keeps the remaining trial days (Stripe needs at least 48 hours).
@@ -54,7 +54,7 @@ export async function startStripeCheckoutAction() {
 export async function openStripePortalAction() {
   const user = await requireUser();
   const stripe = stripeClient();
-  const sub = getSubscription(getControlDb(), user.accountId);
+  const sub = await getSubscription(await getDb(), user.accountId);
   if (!stripe || !sub.stripeCustomerId) redirect("/billing");
   const portal = await stripe.billingPortal.sessions.create({ customer: sub.stripeCustomerId, return_url: `${await appUrl()}/billing` });
   redirect(portal.url);
@@ -74,7 +74,7 @@ export async function startBkashPaymentAction() {
       payerReference: String(user.accountId),
       callbackURL: `${await appUrl()}/api/billing/bkash/callback`,
     });
-    createPendingBkashPayment(getControlDb(), user.accountId, payment.paymentId, amount);
+    await createPendingBkashPayment(await getDb(), user.accountId, payment.paymentId, amount);
     url = payment.bkashURL;
   } catch (e) {
     console.error("bKash create payment failed", e instanceof BkashError ? `${e.code} ${e.message}` : e);

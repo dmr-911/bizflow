@@ -1,8 +1,10 @@
-import type { DB } from "../db";
-import { nowIso } from "../db";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
+import type { Db } from "../db";
+import { idEq, nowIso } from "../db";
+import { billingPayments, subscriptions, webhookEvents } from "../db/schema";
 
 /**
- * Subscription state lives in the control database. Stripe renews itself and
+ * Subscription state lives in the subscriptions table. Stripe renews itself and
  * tells us through webhooks; bKash payments are one month prepaid each, so the
  * paid-through date simply moves forward by a month per completed payment.
  */
@@ -47,19 +49,21 @@ export interface AccessState {
   daysLeft: number;
 }
 
-export function getSubscription(db: DB, accountId: number): Subscription {
-  const row = db
-    .prepare(
-      `SELECT account_id AS accountId, status, provider, trial_ends_at AS trialEndsAt, current_period_end AS currentPeriodEnd,
-              cancel_at_period_end AS cancelAtPeriodEnd, stripe_customer_id AS stripeCustomerId,
-              stripe_subscription_id AS stripeSubscriptionId
-       FROM subscriptions WHERE account_id = ?`,
-    )
-    .get(accountId) as (Omit<Subscription, "cancelAtPeriodEnd"> & { cancelAtPeriodEnd: number }) | undefined;
-  if (!row) {
-    return { accountId, status: "canceled", provider: null, trialEndsAt: null, currentPeriodEnd: null, cancelAtPeriodEnd: false, stripeCustomerId: null, stripeSubscriptionId: null };
-  }
-  return { ...row, cancelAtPeriodEnd: !!row.cancelAtPeriodEnd };
+export async function getSubscription(db: Db, accountId: number): Promise<Subscription> {
+  const [row] = await db.orm
+    .select({
+      accountId: subscriptions.accountId,
+      status: subscriptions.status,
+      provider: subscriptions.provider,
+      trialEndsAt: subscriptions.trialEndsAt,
+      currentPeriodEnd: subscriptions.currentPeriodEnd,
+      cancelAtPeriodEnd: subscriptions.cancelAtPeriodEnd,
+      stripeCustomerId: subscriptions.stripeCustomerId,
+      stripeSubscriptionId: subscriptions.stripeSubscriptionId,
+    })
+    .from(subscriptions)
+    .where(idEq(subscriptions.accountId, accountId));
+  return row ?? { accountId, status: "canceled", provider: null, trialEndsAt: null, currentPeriodEnd: null, cancelAtPeriodEnd: false, stripeCustomerId: null, stripeSubscriptionId: null };
 }
 
 const daysUntil = (iso: string, now: number) => Math.max(0, Math.ceil((Date.parse(iso) - now) / DAY));
@@ -98,25 +102,29 @@ function latest(...isos: (string | null | undefined)[]): string | null {
 }
 
 /** Returns true the first time an event id is seen, false for a retry. */
-export function claimWebhookEvent(db: DB, provider: Provider, eventId: string): boolean {
-  const res = db
-    .prepare("INSERT OR IGNORE INTO webhook_events (provider, event_id, received_at) VALUES (?, ?, ?)")
-    .run(provider, eventId, nowIso());
-  return res.changes > 0;
+export async function claimWebhookEvent(db: Db, provider: Provider, eventId: string): Promise<boolean> {
+  const { rowCount } = await db.orm.insert(webhookEvents).values({ provider, eventId, receivedAt: nowIso() }).onConflictDoNothing();
+  return !!rowCount;
 }
 
-export function releaseWebhookEvent(db: DB, provider: Provider, eventId: string): void {
-  db.prepare("DELETE FROM webhook_events WHERE provider = ? AND event_id = ?").run(provider, eventId);
+export async function releaseWebhookEvent(db: Db, provider: Provider, eventId: string): Promise<void> {
+  await db.orm.delete(webhookEvents).where(and(eq(webhookEvents.provider, provider), eq(webhookEvents.eventId, eventId)));
 }
 
 // ---------- Stripe ----------
 
-export function setStripeCustomer(db: DB, accountId: number, customerId: string): void {
-  db.prepare("UPDATE subscriptions SET stripe_customer_id = ?, updated_at = ? WHERE account_id = ?").run(customerId, nowIso(), accountId);
+export async function setStripeCustomer(db: Db, accountId: number, customerId: string): Promise<void> {
+  await db.orm
+    .update(subscriptions)
+    .set({ stripeCustomerId: customerId, updatedAt: nowIso() })
+    .where(idEq(subscriptions.accountId, accountId));
 }
 
-export function accountForStripeCustomer(db: DB, customerId: string): number | null {
-  const row = db.prepare("SELECT account_id AS id FROM subscriptions WHERE stripe_customer_id = ?").get(customerId) as { id: number } | undefined;
+export async function accountForStripeCustomer(db: Db, customerId: string): Promise<number | null> {
+  const [row] = await db.orm
+    .select({ id: subscriptions.accountId })
+    .from(subscriptions)
+    .where(eq(subscriptions.stripeCustomerId, customerId));
   return row?.id ?? null;
 }
 
@@ -131,64 +139,100 @@ export interface StripeSubscriptionSnapshot {
   cancelAtPeriodEnd: boolean;
 }
 
-/** Mirror a Stripe subscription onto the account. Safe to call repeatedly and out of order. */
-export function syncStripeSubscription(db: DB, s: StripeSubscriptionSnapshot): Subscription {
-  const current = getSubscription(db, s.accountId);
-  // A payment that never completed should not change anything.
-  if (s.status === "incomplete") return current;
-  const status: SubscriptionStatus =
-    s.status === "active" || s.status === "trialing"
-      ? "active"
-      : s.status === "past_due" || s.status === "unpaid"
-        ? "past_due"
-        : "canceled";
-  // Ending a subscription we are not tracking (an old or duplicate one) must not touch the account.
-  if (status === "canceled" && current.stripeSubscriptionId !== s.subscriptionId) return current;
-  const stripeEnd = s.currentPeriodEnd ? new Date(s.currentPeriodEnd * 1000).toISOString() : null;
-  // Never shorten time already paid for (for example a bKash month bought earlier).
-  const periodEnd = status === "canceled" ? current.currentPeriodEnd : latest(current.currentPeriodEnd, stripeEnd);
-  db.prepare(
-    `UPDATE subscriptions SET status = ?, provider = 'stripe', current_period_end = ?, cancel_at_period_end = ?,
-       stripe_customer_id = ?, stripe_subscription_id = ?, updated_at = ? WHERE account_id = ?`,
-  ).run(
-    status,
-    periodEnd,
-    s.cancelAtPeriodEnd ? 1 : 0,
-    s.customerId,
-    status === "canceled" ? null : s.subscriptionId,
-    nowIso(),
-    s.accountId,
-  );
-  return getSubscription(db, s.accountId);
+/** Row lock: two webhooks or callbacks for the same account apply one after the other. Call inside tx. */
+async function lockSubscription(db: Db, accountId: number): Promise<void> {
+  await db.orm.select({ id: subscriptions.accountId }).from(subscriptions).where(idEq(subscriptions.accountId, accountId)).for("update");
 }
 
-export function recordStripeInvoice(
-  db: DB,
+/** Mirror a Stripe subscription onto the account. Safe to call repeatedly and out of order. */
+export async function syncStripeSubscription(db: Db, s: StripeSubscriptionSnapshot): Promise<Subscription> {
+  return db.tx(async (db) => {
+    // Lock the row so two webhooks for the same account apply one after the other.
+    await lockSubscription(db, s.accountId);
+    const current = await getSubscription(db, s.accountId);
+    // A payment that never completed should not change anything.
+    if (s.status === "incomplete") return current;
+    const status: SubscriptionStatus =
+      s.status === "active" || s.status === "trialing"
+        ? "active"
+        : s.status === "past_due" || s.status === "unpaid"
+          ? "past_due"
+          : "canceled";
+    // Ending a subscription we are not tracking (an old or duplicate one) must not touch the account.
+    if (status === "canceled" && current.stripeSubscriptionId !== s.subscriptionId) return current;
+    const stripeEnd = s.currentPeriodEnd ? new Date(s.currentPeriodEnd * 1000).toISOString() : null;
+    // Never shorten time already paid for (for example a bKash month bought earlier).
+    const periodEnd = status === "canceled" ? current.currentPeriodEnd : latest(current.currentPeriodEnd, stripeEnd);
+    await db.orm
+      .update(subscriptions)
+      .set({
+        status,
+        provider: "stripe",
+        currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: s.cancelAtPeriodEnd,
+        stripeCustomerId: s.customerId,
+        stripeSubscriptionId: status === "canceled" ? null : s.subscriptionId,
+        updatedAt: nowIso(),
+      })
+      .where(idEq(subscriptions.accountId, s.accountId));
+    return getSubscription(db, s.accountId);
+  });
+}
+
+export async function recordStripeInvoice(
+  db: Db,
   p: { accountId: number; invoiceId: string; amount: number; currency: string; paid: boolean; periodStart: number | null; periodEnd: number | null },
-): void {
+): Promise<void> {
   const iso = (u: number | null) => (u ? new Date(u * 1000).toISOString() : null);
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO billing_payments (account_id, provider, provider_ref, amount, currency, status, period_start, period_end, created_at, updated_at)
-     VALUES (?, 'stripe', ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(provider, provider_ref) DO UPDATE SET status = excluded.status, amount = excluded.amount, updated_at = excluded.updated_at`,
-  ).run(p.accountId, p.invoiceId, p.amount, p.currency.toUpperCase(), p.paid ? "paid" : "failed", iso(p.periodStart), iso(p.periodEnd), now, now);
+  await db.orm
+    .insert(billingPayments)
+    .values({
+      accountId: p.accountId,
+      provider: "stripe",
+      providerRef: p.invoiceId,
+      amount: p.amount,
+      currency: p.currency.toUpperCase(),
+      status: p.paid ? "paid" : "failed",
+      periodStart: iso(p.periodStart),
+      periodEnd: iso(p.periodEnd),
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: [billingPayments.provider, billingPayments.providerRef],
+      set: { status: sql`excluded.status`, amount: sql`excluded.amount`, updatedAt: sql`excluded.updated_at` },
+    });
 }
 
 // ---------- bKash ----------
 
-export function createPendingBkashPayment(db: DB, accountId: number, paymentId: string, amount: number): void {
+export async function createPendingBkashPayment(db: Db, accountId: number, paymentId: string, amount: number): Promise<void> {
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO billing_payments (account_id, provider, provider_ref, amount, currency, status, created_at, updated_at)
-     VALUES (?, 'bkash', ?, ?, 'BDT', 'pending', ?, ?)`,
-  ).run(accountId, paymentId, amount, now, now);
+  await db.orm.insert(billingPayments).values({
+    accountId,
+    provider: "bkash",
+    providerRef: paymentId,
+    amount,
+    currency: "BDT",
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
-export function pendingBkashPayment(db: DB, paymentId: string): { accountId: number; amount: number; status: string } | null {
-  const row = db
-    .prepare("SELECT account_id AS accountId, amount, status FROM billing_payments WHERE provider = 'bkash' AND provider_ref = ?")
-    .get(paymentId) as { accountId: number; amount: number; status: string } | undefined;
+const bkashPayment = (paymentId: string) => and(eq(billingPayments.provider, "bkash"), eq(billingPayments.providerRef, paymentId));
+
+export async function pendingBkashPayment(
+  db: Db,
+  paymentId: string,
+  opts: { forUpdate?: boolean } = {},
+): Promise<{ accountId: number; amount: number; status: string } | null> {
+  const query = db.orm
+    .select({ accountId: billingPayments.accountId, amount: billingPayments.amount, status: billingPayments.status })
+    .from(billingPayments)
+    .where(bkashPayment(paymentId));
+  const [row] = await (opts.forUpdate ? query.for("update") : query);
   return row ?? null;
 }
 
@@ -197,32 +241,36 @@ export function pendingBkashPayment(db: DB, paymentId: string): { accountId: num
  * is later: now, the end of the trial, or the current paid-through date.
  * Idempotent: a payment already marked paid changes nothing.
  */
-export function completeBkashPayment(db: DB, paymentId: string, trxId: string): { extended: boolean; periodEnd: string | null } {
-  return db.transaction(() => {
-    const p = pendingBkashPayment(db, paymentId);
+export async function completeBkashPayment(db: Db, paymentId: string, trxId: string): Promise<{ extended: boolean; periodEnd: string | null }> {
+  return db.tx(async (db) => {
+    // Row locks: a repeated callback waits here and then sees the payment already paid.
+    const p = await pendingBkashPayment(db, paymentId, { forUpdate: true });
     if (!p) throw new Error("Unknown bKash payment");
-    if (p.status === "paid") return { extended: false, periodEnd: getSubscription(db, p.accountId).currentPeriodEnd };
-    const sub = getSubscription(db, p.accountId);
+    await lockSubscription(db, p.accountId);
+    if (p.status === "paid") return { extended: false, periodEnd: (await getSubscription(db, p.accountId)).currentPeriodEnd };
+    const sub = await getSubscription(db, p.accountId);
     const now = nowIso();
     const start = latest(now, sub.currentPeriodEnd, sub.status === "trialing" ? sub.trialEndsAt : null)!;
     const end = addMonthsIso(start, 1);
-    db.prepare(
-      `UPDATE billing_payments SET status = 'paid', trx_id = ?, period_start = ?, period_end = ?, updated_at = ?
-       WHERE provider = 'bkash' AND provider_ref = ?`,
-    ).run(trxId, start, end, now, paymentId);
+    await db.orm
+      .update(billingPayments)
+      .set({ status: "paid", trxId, periodStart: start, periodEnd: end, updatedAt: now })
+      .where(bkashPayment(paymentId));
     // A Stripe subscription, if any, keeps its own status; bKash only moves the paid-through date.
     const keepStripe = sub.provider === "stripe" && sub.status !== "canceled";
-    db.prepare(
-      `UPDATE subscriptions SET status = ?, provider = ?, current_period_end = ?, updated_at = ? WHERE account_id = ?`,
-    ).run(keepStripe ? sub.status : "active", keepStripe ? "stripe" : "bkash", end, now, p.accountId);
+    await db.orm
+      .update(subscriptions)
+      .set({ status: keepStripe ? sub.status : "active", provider: keepStripe ? "stripe" : "bkash", currentPeriodEnd: end, updatedAt: now })
+      .where(idEq(subscriptions.accountId, p.accountId));
     return { extended: true, periodEnd: end };
-  })();
+  });
 }
 
-export function failBkashPayment(db: DB, paymentId: string, status: "failed" | "cancelled"): void {
-  db.prepare(
-    "UPDATE billing_payments SET status = ?, updated_at = ? WHERE provider = 'bkash' AND provider_ref = ? AND status = 'pending'",
-  ).run(status, nowIso(), paymentId);
+export async function failBkashPayment(db: Db, paymentId: string, status: "failed" | "cancelled"): Promise<void> {
+  await db.orm
+    .update(billingPayments)
+    .set({ status, updatedAt: nowIso() })
+    .where(and(bkashPayment(paymentId), eq(billingPayments.status, "pending")));
 }
 
 export interface BillingPayment {
@@ -238,12 +286,22 @@ export interface BillingPayment {
   createdAt: string;
 }
 
-export function listBillingPayments(db: DB, accountId: number, limit = 24): BillingPayment[] {
-  return db
-    .prepare(
-      `SELECT id, provider, provider_ref AS reference, trx_id AS trxId, amount, currency, status, period_start AS periodStart,
-              period_end AS periodEnd, created_at AS createdAt
-       FROM billing_payments WHERE account_id = ? AND status != 'pending' ORDER BY created_at DESC, id DESC LIMIT ?`,
-    )
-    .all(accountId, limit) as BillingPayment[];
+export async function listBillingPayments(db: Db, accountId: number, limit = 24): Promise<BillingPayment[]> {
+  return db.orm
+    .select({
+      id: billingPayments.id,
+      provider: billingPayments.provider,
+      reference: billingPayments.providerRef,
+      trxId: billingPayments.trxId,
+      amount: billingPayments.amount,
+      currency: billingPayments.currency,
+      status: billingPayments.status,
+      periodStart: billingPayments.periodStart,
+      periodEnd: billingPayments.periodEnd,
+      createdAt: billingPayments.createdAt,
+    })
+    .from(billingPayments)
+    .where(and(idEq(billingPayments.accountId, accountId), ne(billingPayments.status, "pending")))
+    .orderBy(desc(billingPayments.createdAt), desc(billingPayments.id))
+    .limit(limit);
 }

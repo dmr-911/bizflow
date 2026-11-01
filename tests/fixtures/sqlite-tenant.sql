@@ -1,16 +1,5 @@
-/**
- * Schema migrations. Each entry runs once, in order, inside a transaction.
- * Append new migrations; never edit one that has shipped.
- *
- * Conventions: money columns are INTEGER minor units, quantities are INTEGER
- * thousandths, rates are INTEGER basis points, dates are TEXT 'YYYY-MM-DD',
- * timestamps are TEXT ISO-8601 UTC.
- */
-export const MIGRATIONS: { id: number; name: string; sql: string }[] = [
-  {
-    id: 1,
-    name: "initial schema",
-    sql: `
+-- Schema of tenants/<id>.db as created by the SQLite version (before the move to Postgres).
+-- Used by tests/sqlite-import.test.ts.
 CREATE TABLE settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -129,6 +118,3 @@ CREATE TABLE activities (
 );
 CREATE INDEX activities_created ON activities(created_at DESC);
 CREATE INDEX activities_customer ON activities(customer_id);
-`,
-  },
-];

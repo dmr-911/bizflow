@@ -6,7 +6,7 @@ import { pageContext } from "@/lib/server/context";
 
 export default async function EditCustomerPage({ params }: { params: Promise<{ id: string }> }) {
   const { db, t } = await pageContext();
-  const c = getCustomer(db, Number((await params).id));
+  const c = await getCustomer(db, Number((await params).id));
   if (!c) notFound();
   const { id, archivedAt, createdAt, updatedAt, ...values } = c;
   void archivedAt; void createdAt; void updatedAt;

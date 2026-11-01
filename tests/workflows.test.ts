@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { openDatabase, type DB } from "@/lib/db";
+import { getDb, type TenantDb } from "@/lib/db";
 import { createCustomer, listCustomers, setCustomerArchived, updateCustomer } from "@/lib/services/customers";
 import {
   cancelInvoice,
@@ -29,10 +29,14 @@ import {
   resetPassword,
   sessionUser,
 } from "@/lib/services/auth";
-import { CONTROL_MIGRATIONS } from "@/lib/db/control-migrations";
 import { toCsv } from "@/lib/csv";
+import { eq, sql } from "drizzle-orm";
+import { documents, users } from "@/lib/db/schema";
+import { newTenant, pgFailure, useTestDatabase } from "./helpers/db";
 
-let db: DB;
+useTestDatabase();
+
+let db: TenantDb;
 const TODAY = "2026-10-29";
 
 const customer = (name = "Farhana Rahman", company = name === "Farhana Rahman" ? "Rahman Textiles" : "") =>
@@ -52,37 +56,37 @@ const docInput = (customerId: number, overrides: Record<string, unknown> = {}) =
   ...overrides,
 });
 
-beforeEach(() => {
-  db = openDatabase(":memory:");
+beforeEach(async () => {
+  db = await newTenant();
 });
 
 describe("customers", () => {
-  it("creates, edits, searches and archives", () => {
-    const c = customer();
-    customer("Tanvir Hasan");
-    updateCustomer(db, c.id, { ...c, notes: "VIP client" });
-    expect(listCustomers(db, { search: "rahman" }).map((x) => x.name)).toEqual(["Farhana Rahman"]);
-    expect(listCustomers(db, { search: "%" })).toHaveLength(0); // LIKE wildcards are escaped
-    setCustomerArchived(db, c.id, true);
-    expect(listCustomers(db).map((x) => x.name)).toEqual(["Tanvir Hasan"]);
-    expect(listCustomers(db, { archivedOnly: true })[0].notes).toBe("VIP client");
+  it("creates, edits, searches and archives", async () => {
+    const c = await customer();
+    await customer("Tanvir Hasan");
+    await updateCustomer(db, c.id, { ...c, notes: "VIP client" });
+    expect((await listCustomers(db, { search: "rahman" })).map((x) => x.name)).toEqual(["Farhana Rahman"]);
+    expect(await listCustomers(db, { search: "%" })).toHaveLength(0); // LIKE wildcards are escaped
+    await setCustomerArchived(db, c.id, true);
+    expect((await listCustomers(db)).map((x) => x.name)).toEqual(["Tanvir Hasan"]);
+    expect((await listCustomers(db, { archivedOnly: true }))[0].notes).toBe("VIP client");
   });
 
-  it("validates input", () => {
-    expect(() => createCustomer(db, { name: "", email: "nope" } as never)).toThrow();
+  it("validates input", async () => {
+    await expect(createCustomer(db, { name: "", email: "nope" } as never)).rejects.toThrow();
   });
 
-  it("blocks new documents for archived customers", () => {
-    const c = customer();
-    setCustomerArchived(db, c.id, true);
-    expect(() => createDocument(db, "invoice", docInput(c.id))).toThrow(/Archived/);
+  it("blocks new documents for archived customers", async () => {
+    const c = await customer();
+    await setCustomerArchived(db, c.id, true);
+    await expect(createDocument(db, "invoice", docInput(c.id))).rejects.toThrow(/Archived/);
   });
 });
 
 describe("quotation to invoice workflow", () => {
-  it("calculates totals server side, converts once, and keeps totals", () => {
-    const c = customer();
-    const q = createDocument(db, "quotation", docInput(c.id));
+  it("calculates totals server side, converts once, and keeps totals", async () => {
+    const c = await customer();
+    const q = await createDocument(db, "quotation", docInput(c.id));
     // 2 x 500 = 1000, -10% = 900, +15% VAT = 1035; hosting 1200.50 => 2235.50
     expect(q.number).toBe("QT-2026-0001");
     expect(q.subtotal).toBe(220050);
@@ -91,213 +95,219 @@ describe("quotation to invoice workflow", () => {
     expect(q.total).toBe(223550);
     expect(q.items[0].taxName).toBe("VAT 15%");
 
-    expect(() => convertQuotationToInvoice(db, q.id, TODAY)).toThrow(/accepted/);
-    setQuotationStatus(db, q.id, "sent");
-    setQuotationStatus(db, q.id, "accepted");
-    const inv = convertQuotationToInvoice(db, q.id, TODAY);
+    await expect(convertQuotationToInvoice(db, q.id, TODAY)).rejects.toThrow(/accepted/);
+    await setQuotationStatus(db, q.id, "sent");
+    await setQuotationStatus(db, q.id, "accepted");
+    const inv = await convertQuotationToInvoice(db, q.id, TODAY);
     expect(inv.kind).toBe("invoice");
     expect(inv.number).toBe("INV-2026-0001");
     expect(inv.total).toBe(q.total);
     expect(inv.items).toHaveLength(2);
     expect(inv.dueDate).toBe("2026-11-12"); // 14 day default terms
-    expect(getDocument(db, q.id)!.status).toBe("converted");
-    expect(getDocument(db, q.id)!.linked?.number).toBe(inv.number);
-    expect(() => convertQuotationToInvoice(db, q.id, TODAY)).toThrow();
+    expect((await getDocument(db, q.id))!.status).toBe("converted");
+    expect((await getDocument(db, q.id))!.linked?.number).toBe(inv.number);
+    await expect(convertQuotationToInvoice(db, q.id, TODAY)).rejects.toThrow();
   });
 
-  it("deleting the draft invoice re-opens the quotation", () => {
-    const c = customer();
-    const q = createDocument(db, "quotation", docInput(c.id));
-    setQuotationStatus(db, q.id, "accepted");
-    const inv = convertQuotationToInvoice(db, q.id, TODAY);
-    deleteDraftDocument(db, inv.id);
-    expect(getDocument(db, q.id)!.status).toBe("accepted");
+  it("deleting the draft invoice re-opens the quotation", async () => {
+    const c = await customer();
+    const q = await createDocument(db, "quotation", docInput(c.id));
+    await setQuotationStatus(db, q.id, "accepted");
+    const inv = await convertQuotationToInvoice(db, q.id, TODAY);
+    await deleteDraftDocument(db, inv.id);
+    expect((await getDocument(db, q.id))!.status).toBe("accepted");
   });
 
-  it("tax snapshot survives settings changes", () => {
-    const c = customer();
-    const q = createDocument(db, "quotation", docInput(c.id));
-    const s = getSettings(db);
-    saveSettings(db, { ...s, taxRates: s.taxRates.map((t) => (t.id === "vat15" ? { ...t, rateBps: 2000 } : t)) });
-    expect(getDocument(db, q.id)!.total).toBe(223550);
+  it("tax snapshot survives settings changes", async () => {
+    const c = await customer();
+    const q = await createDocument(db, "quotation", docInput(c.id));
+    const s = await getSettings(db);
+    await saveSettings(db, { ...s, taxRates: s.taxRates.map((t) => (t.id === "vat15" ? { ...t, rateBps: 2000 } : t)) });
+    expect((await getDocument(db, q.id))!.total).toBe(223550);
   });
 });
 
 describe("invoice workflow", () => {
-  it("issues unique numbers even if the counter is lowered", () => {
-    const c = customer();
-    const a = createDocument(db, "invoice", docInput(c.id));
-    const s = getSettings(db);
-    saveSettings(db, { ...s, invoiceNumbering: { ...s.invoiceNumbering, next: 1 } });
-    const b = createDocument(db, "invoice", docInput(c.id));
+  it("issues unique numbers even if the counter is lowered", async () => {
+    const c = await customer();
+    const a = await createDocument(db, "invoice", docInput(c.id));
+    const s = await getSettings(db);
+    await saveSettings(db, { ...s, invoiceNumbering: { ...s.invoiceNumbering, next: 1 } });
+    const b = await createDocument(db, "invoice", docInput(c.id));
     expect(a.number).toBe("INV-2026-0001");
     expect(b.number).toBe("INV-2026-0002");
-    expect(() =>
-      db.prepare("UPDATE documents SET number = ? WHERE id = ?").run(a.number, b.id),
-    ).toThrow(/UNIQUE/);
+    expect(await pgFailure(db.orm.update(documents).set({ number: a.number }).where(db.byId(documents, b.id)))).toMatch(
+      /documents_account_id_kind_number_key/,
+    );
   });
 
-  it("goes draft -> sent -> partially paid -> paid with payment history", () => {
-    const c = customer();
-    const inv = createDocument(db, "invoice", docInput(c.id));
-    expect(() => recordPayment(db, inv.id, { amount: "100", paidAt: TODAY, method: "cash" })).toThrow(/sent/);
-    markInvoiceSent(db, inv.id);
-    recordPayment(db, inv.id, { amount: "1000", paidAt: "2026-10-05", method: "bkash", reference: "TX1" });
-    let d = getDocument(db, inv.id, TODAY)!;
+  it("goes draft -> sent -> partially paid -> paid with payment history", async () => {
+    const c = await customer();
+    const inv = await createDocument(db, "invoice", docInput(c.id));
+    await expect(recordPayment(db, inv.id, { amount: "100", paidAt: TODAY, method: "cash" })).rejects.toThrow(/sent/);
+    await markInvoiceSent(db, inv.id);
+    await recordPayment(db, inv.id, { amount: "1000", paidAt: "2026-10-05", method: "bkash", reference: "TX1" });
+    let d = (await getDocument(db, inv.id, TODAY))!;
     expect(d.status).toBe("partially_paid");
     expect(d.displayStatus).toBe("overdue"); // due 2026-10-15
     expect(d.balance).toBe(123550);
-    expect(() => recordPayment(db, inv.id, { amount: "1235.51", paidAt: TODAY, method: "cash" })).toThrow(/exceeds/);
-    recordPayment(db, inv.id, { amount: "1235.50", paidAt: TODAY, method: "bank" });
-    d = getDocument(db, inv.id, TODAY)!;
+    await expect(recordPayment(db, inv.id, { amount: "1235.51", paidAt: TODAY, method: "cash" })).rejects.toThrow(/exceeds/);
+    await recordPayment(db, inv.id, { amount: "1235.50", paidAt: TODAY, method: "bank" });
+    d = (await getDocument(db, inv.id, TODAY))!;
     expect(d.status).toBe("paid");
     expect(d.displayStatus).toBe("paid");
     expect(d.paidAt).toBe(TODAY);
     expect(d.payments.map((p) => p.amount)).toEqual([100000, 123550]);
-    expect(() => cancelInvoice(db, inv.id)).toThrow();
+    await expect(cancelInvoice(db, inv.id)).rejects.toThrow();
 
-    deletePayment(db, d.payments[1].id);
-    expect(getDocument(db, inv.id)!.status).toBe("partially_paid");
+    await deletePayment(db, d.payments[1].id);
+    expect((await getDocument(db, inv.id))!.status).toBe("partially_paid");
   });
 
-  it("only drafts are editable; cancelled is terminal", () => {
-    const c = customer();
-    const inv = createDocument(db, "invoice", docInput(c.id));
-    updateDocument(db, inv.id, docInput(c.id, { notes: "updated" }));
-    markInvoiceSent(db, inv.id);
-    expect(() => updateDocument(db, inv.id, docInput(c.id))).toThrow(/edited/);
-    cancelInvoice(db, inv.id);
-    expect(() => markInvoiceSent(db, inv.id)).toThrow();
-    expect(() => recordPayment(db, inv.id, { amount: "1", paidAt: TODAY, method: "cash" })).toThrow();
-    expect(() => deleteDraftDocument(db, inv.id)).toThrow();
+  it("only drafts are editable; cancelled is terminal", async () => {
+    const c = await customer();
+    const inv = await createDocument(db, "invoice", docInput(c.id));
+    await updateDocument(db, inv.id, docInput(c.id, { notes: "updated" }));
+    await markInvoiceSent(db, inv.id);
+    await expect(updateDocument(db, inv.id, docInput(c.id))).rejects.toThrow(/edited/);
+    await cancelInvoice(db, inv.id);
+    await expect(markInvoiceSent(db, inv.id)).rejects.toThrow();
+    await expect(recordPayment(db, inv.id, { amount: "1", paidAt: TODAY, method: "cash" })).rejects.toThrow();
+    await expect(deleteDraftDocument(db, inv.id)).rejects.toThrow();
   });
 
-  it("filters by derived status", () => {
-    const c = customer();
-    const a = createDocument(db, "invoice", docInput(c.id));
-    markInvoiceSent(db, a.id);
-    createDocument(db, "invoice", docInput(c.id, { dueDate: "2026-12-01" }));
-    expect(listDocuments(db, "invoice", { status: "overdue" }, TODAY).map((d) => d.id)).toEqual([a.id]);
-    expect(listDocuments(db, "invoice", { status: "draft" }, TODAY)).toHaveLength(1);
-    expect(listDocuments(db, "invoice", { status: "unpaid" }, TODAY)).toHaveLength(1);
+  it("filters by derived status", async () => {
+    const c = await customer();
+    const a = await createDocument(db, "invoice", docInput(c.id));
+    await markInvoiceSent(db, a.id);
+    await createDocument(db, "invoice", docInput(c.id, { dueDate: "2026-12-01" }));
+    expect((await listDocuments(db, "invoice", { status: "overdue" }, TODAY)).map((d) => d.id)).toEqual([a.id]);
+    expect(await listDocuments(db, "invoice", { status: "draft" }, TODAY)).toHaveLength(1);
+    expect(await listDocuments(db, "invoice", { status: "unpaid" }, TODAY)).toHaveLength(1);
   });
 
-  it("rejects invalid documents", () => {
-    const c = customer();
-    expect(() => createDocument(db, "invoice", docInput(c.id, { items: [] }))).toThrow();
-    expect(() => createDocument(db, "invoice", docInput(c.id, { dueDate: "2026-09-01" }))).toThrow();
-    expect(() =>
+  it("rejects invalid documents", async () => {
+    const c = await customer();
+    await expect(createDocument(db, "invoice", docInput(c.id, { items: [] }))).rejects.toThrow();
+    await expect(createDocument(db, "invoice", docInput(c.id, { dueDate: "2026-09-01" }))).rejects.toThrow();
+    await expect(
       createDocument(db, "invoice", docInput(c.id, { items: [{ description: "x", quantity: "-1", unitPrice: "1" }] })),
-    ).toThrow();
-    expect(() =>
+    ).rejects.toThrow();
+    await expect(
       createDocument(db, "invoice", docInput(c.id, { items: [{ description: "x", quantity: "1", unitPrice: "1", taxRateId: "bogus" }] })),
-    ).toThrow(/tax/);
+    ).rejects.toThrow(/tax/);
   });
 });
 
 describe("follow-ups", () => {
-  it("filters pending, overdue and completed", () => {
-    const c = customer();
-    const a = createFollowUp(db, { title: "Call", dueDate: "2026-10-20", customerId: c.id });
-    createFollowUp(db, { title: "Email", dueDate: TODAY, customerId: c.id });
-    createFollowUp(db, { title: "Visit", dueDate: "2026-11-05" });
-    expect(listFollowUps(db, { filter: "overdue" }, TODAY).map((f) => f.title)).toEqual(["Call"]);
-    expect(listFollowUps(db, { filter: "pending" }, TODAY).map((f) => f.title)).toEqual(["Email", "Visit"]);
-    expect(reminderCounts(db, TODAY)).toEqual({ overdue: 1, dueToday: 1 });
-    setFollowUpCompleted(db, a, true);
-    expect(listFollowUps(db, { filter: "completed" }, TODAY).map((f) => f.title)).toEqual(["Call"]);
-    expect(reminderCounts(db, TODAY).overdue).toBe(0);
+  it("filters pending, overdue and completed", async () => {
+    const c = await customer();
+    const a = await createFollowUp(db, { title: "Call", dueDate: "2026-10-20", customerId: c.id });
+    await createFollowUp(db, { title: "Email", dueDate: TODAY, customerId: c.id });
+    await createFollowUp(db, { title: "Visit", dueDate: "2026-11-05" });
+    expect((await listFollowUps(db, { filter: "overdue" }, TODAY)).map((f) => f.title)).toEqual(["Call"]);
+    expect((await listFollowUps(db, { filter: "pending" }, TODAY)).map((f) => f.title)).toEqual(["Email", "Visit"]);
+    expect(await reminderCounts(db, TODAY)).toEqual({ overdue: 1, dueToday: 1 });
+    await setFollowUpCompleted(db, a, true);
+    expect((await listFollowUps(db, { filter: "completed" }, TODAY)).map((f) => f.title)).toEqual(["Call"]);
+    expect((await reminderCounts(db, TODAY)).overdue).toBe(0);
   });
 });
 
 describe("reports", () => {
-  it("summarises revenue, outstanding balances and activity per currency", () => {
-    const c1 = customer();
-    const c2 = customer("Sarah Mitchell");
-    const a = createDocument(db, "invoice", docInput(c1.id, { issueDate: "2026-09-10", dueDate: "2026-09-20" }));
-    markInvoiceSent(db, a.id);
-    recordPayment(db, a.id, { amount: "1000", paidAt: "2026-09-25", method: "cash" });
-    const b = createDocument(db, "invoice", docInput(c2.id, { currency: "USD", issueDate: "2026-10-02", dueDate: "2026-11-02" }));
-    markInvoiceSent(db, b.id);
-    recordPayment(db, b.id, { amount: "2235.50", paidAt: "2026-10-03", method: "bank" });
+  it("summarises revenue, outstanding balances and activity per currency", async () => {
+    const c1 = await customer();
+    const c2 = await customer("Sarah Mitchell");
+    const a = await createDocument(db, "invoice", docInput(c1.id, { issueDate: "2026-09-10", dueDate: "2026-09-20" }));
+    await markInvoiceSent(db, a.id);
+    await recordPayment(db, a.id, { amount: "1000", paidAt: "2026-09-25", method: "cash" });
+    const b = await createDocument(db, "invoice", docInput(c2.id, { currency: "USD", issueDate: "2026-10-02", dueDate: "2026-11-02" }));
+    await markInvoiceSent(db, b.id);
+    await recordPayment(db, b.id, { amount: "2235.50", paidAt: "2026-10-03", method: "bank" });
 
-    const months = revenueByMonth(db, { months: 3, currency: "BDT", today: TODAY });
+    const months = await revenueByMonth(db, { months: 3, currency: "BDT", today: TODAY });
     expect(months.map((m) => m.month)).toEqual(["2026-08", "2026-09", "2026-10"]);
     expect(months[1]).toMatchObject({ invoiced: 223550, received: 100000 });
-    expect(revenueByMonth(db, { months: 1, currency: "USD", today: TODAY })[0].received).toBe(223550);
+    expect((await revenueByMonth(db, { months: 1, currency: "USD", today: TODAY }))[0].received).toBe(223550);
 
-    const out = outstandingBalances(db, TODAY);
+    const out = await outstandingBalances(db, TODAY);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ customerName: "Farhana Rahman", currency: "BDT", total: 123550, days31to60: 123550 });
 
-    const stats = dashboardStats(db, TODAY);
+    const stats = await dashboardStats(db, TODAY);
     expect(stats.invoiceCount).toBe(2);
     expect(stats.paid).toEqual({ BDT: 100000, USD: 223550 });
     expect(stats.outstanding).toEqual({ BDT: 123550 });
     expect(stats.overdueCount).toBe(1);
 
-    const active = mostActiveCustomers(db, { since: "2026-01-01" });
+    const active = await mostActiveCustomers(db, { since: "2026-01-01" });
     expect(active.map((r) => r.customerName).sort()).toEqual(["Farhana Rahman", "Sarah Mitchell"]);
     expect(active.every((r) => r.activityCount === 2)).toBe(true);
     expect(active.find((r) => r.customerName === "Sarah Mitchell")!.received).toEqual({ USD: 223550 });
+
+    // Per-customer counts must not leak between customers (correlated subqueries).
+    await createDocument(db, "quotation", docInput(c2.id));
+    const list = await listCustomers(db);
+    expect(list.map((r) => [r.name, r.invoiceCount, r.quotationCount])).toEqual([
+      ["Farhana Rahman", 1, 0],
+      ["Sarah Mitchell", 1, 1],
+    ]);
   });
 });
 
 describe("demo data, reset and backup", () => {
-  it("seeds consistent demo data that survives a backup round trip", () => {
-    seedDemoData(db, TODAY);
-    const before = dashboardStats(db, TODAY);
+  it("seeds consistent demo data that survives a backup round trip", async () => {
+    await seedDemoData(db, TODAY);
+    const before = await dashboardStats(db, TODAY);
     expect(before.invoiceCount).toBeGreaterThan(5);
     expect(before.overdueCount).toBeGreaterThan(0);
     // Every stored total matches its lines.
-    const bad = db
-      .prepare(
-        `SELECT d.id FROM documents d WHERE d.total != (SELECT COALESCE(SUM(line_total),0) FROM document_items i WHERE i.document_id = d.id)`,
-      )
-      .all();
+    const bad = await db.rows(sql`
+      SELECT d.id FROM documents d WHERE d.account_id = ${db.accountId}
+        AND d.total != (SELECT COALESCE(SUM(line_total), 0) FROM document_items i WHERE i.account_id = d.account_id AND i.document_id = d.id)`);
     expect(bad).toEqual([]);
 
-    const backup = JSON.parse(JSON.stringify(exportBackup(db)));
-    resetBusinessData(db);
-    expect(dashboardStats(db, TODAY).invoiceCount).toBe(0);
-    expect(getSettings(db).invoiceNumbering.next).toBe(1);
-    restoreBackup(db, backup);
-    expect(dashboardStats(db, TODAY)).toEqual(before);
+    const backup = JSON.parse(JSON.stringify(await exportBackup(db)));
+    await resetBusinessData(db);
+    expect((await dashboardStats(db, TODAY)).invoiceCount).toBe(0);
+    expect((await getSettings(db)).invoiceNumbering.next).toBe(1);
+    await restoreBackup(db, backup);
+    expect(await dashboardStats(db, TODAY)).toEqual(before);
   });
 });
 
 describe("auth", () => {
-  it("creates an account with a trial, hashes passwords and validates sessions", () => {
-    const control = openDatabase(":memory:", CONTROL_MIGRATIONS);
-    const { accountId, userId } = createAccount(
+  it("creates an account with a trial, hashes passwords and validates sessions", async () => {
+    const control = await getDb();
+    const { accountId, userId } = await createAccount(
       control,
       { name: "Farhana", businessName: "Rahman Textiles", email: "Owner@Example.com", password: "correct horse battery" },
       { trialDays: 14 },
     );
-    expect(() =>
+    await expect(
       createAccount(control, { name: "X", businessName: "Y", email: "owner@example.com", password: "another password" }, { trialDays: 14 }),
-    ).toThrow(EmailTakenError);
-    expect(authenticate(control, "owner@example.com", "wrong password!")).toBeNull();
-    const u = authenticate(control, " OWNER@example.com ", "correct horse battery");
+    ).rejects.toThrow(EmailTakenError);
+    expect(await authenticate(control, "owner@example.com", "wrong password!")).toBeNull();
+    const u = await authenticate(control, " OWNER@example.com ", "correct horse battery");
     expect(u).toMatchObject({ id: userId, accountId, email: "owner@example.com", businessName: "Rahman Textiles" });
-    const hash = (control.prepare("SELECT password_hash FROM users").get() as { password_hash: string }).password_hash;
+    const [{ hash }] = await control.orm.select({ hash: users.passwordHash }).from(users).where(eq(users.id, userId));
     expect(hash).not.toContain("correct");
-    const { token } = createSession(control, u!.id, 1);
-    expect(sessionUser(control, token)?.accountId).toBe(accountId);
-    expect(sessionUser(control, token + "x")).toBeNull();
+    const { token } = await createSession(control, u!.id, 1);
+    expect((await sessionUser(control, token))?.accountId).toBe(accountId);
+    expect(await sessionUser(control, token + "x")).toBeNull();
   });
 
-  it("resets a password once with an emailed token and signs out old sessions", () => {
-    const control = openDatabase(":memory:", CONTROL_MIGRATIONS);
-    const { userId } = createAccount(control, { name: "A", businessName: "B", email: "a@example.com", password: "first password 1" }, { trialDays: 14 });
-    const { token: session } = createSession(control, userId, 1);
-    expect(createPasswordReset(control, "nobody@example.com")).toBeNull();
-    const reset = createPasswordReset(control, "A@example.com")!;
-    expect(isResetTokenValid(control, reset)).toBe(true);
-    expect(resetPassword(control, reset, "second password 2")).toBe(userId);
-    expect(resetPassword(control, reset, "third password 3")).toBeNull();
-    expect(sessionUser(control, session)).toBeNull();
-    expect(authenticate(control, "a@example.com", "second password 2")?.id).toBe(userId);
+  it("resets a password once with an emailed token and signs out old sessions", async () => {
+    const control = await getDb();
+    const { userId } = await createAccount(control, { name: "A", businessName: "B", email: "a@example.com", password: "first password 1" }, { trialDays: 14 });
+    const { token: session } = await createSession(control, userId, 1);
+    expect(await createPasswordReset(control, "nobody@example.com")).toBeNull();
+    const reset = (await createPasswordReset(control, "A@example.com"))!;
+    expect(await isResetTokenValid(control, reset)).toBe(true);
+    expect(await resetPassword(control, reset, "second password 2")).toBe(userId);
+    expect(await resetPassword(control, reset, "third password 3")).toBeNull();
+    expect(await sessionUser(control, session)).toBeNull();
+    expect((await authenticate(control, "a@example.com", "second password 2"))?.id).toBe(userId);
   });
 });
 

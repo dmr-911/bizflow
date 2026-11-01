@@ -1,5 +1,7 @@
-import type { DB } from "../db";
-import { nowIso } from "../db";
+import { and, asc, desc, eq, ilike, or, sql } from "drizzle-orm";
+import type { TenantDb } from "../db";
+import { idEq, nowIso } from "../db";
+import { customers, documentItems, documents, payments } from "../db/schema";
 import { calculateDocument, type DiscountType, type LineInput } from "../calc";
 import { formatMoney, type Currency } from "../money";
 import { addDays, todayIso } from "../dates";
@@ -87,14 +89,53 @@ export interface DocumentDetail extends DocumentRow {
   linked: { id: number; kind: DocumentKind; number: string } | null;
 }
 
-const SELECT = `
-  SELECT d.id, d.kind, d.number, d.status, d.customer_id AS customerId, c.name AS customerName,
-         c.company AS customerCompany, d.issue_date AS issueDate, d.due_date AS dueDate, d.currency,
-         d.subtotal, d.discount_total AS discountTotal, d.tax_total AS taxTotal, d.total,
-         d.amount_paid AS amountPaid, d.total - d.amount_paid AS balance, d.notes, d.terms,
-         d.source_document_id AS sourceDocumentId, d.sent_at AS sentAt, d.paid_at AS paidAt,
-         d.cancelled_at AS cancelledAt, d.created_at AS createdAt, d.updated_at AS updatedAt
-  FROM documents d JOIN customers c ON c.id = d.customer_id`;
+const documentColumns = {
+  id: documents.id,
+  kind: documents.kind,
+  number: documents.number,
+  status: sql<InvoiceStatus | QuotationStatus>`${documents.status}`,
+  customerId: documents.customerId,
+  customerName: customers.name,
+  customerCompany: customers.company,
+  issueDate: documents.issueDate,
+  dueDate: documents.dueDate,
+  currency: documents.currency,
+  subtotal: documents.subtotal,
+  discountTotal: documents.discountTotal,
+  taxTotal: documents.taxTotal,
+  total: documents.total,
+  amountPaid: documents.amountPaid,
+  balance: sql<number>`${documents.total} - ${documents.amountPaid}`,
+  notes: documents.notes,
+  terms: documents.terms,
+  sourceDocumentId: documents.sourceDocumentId,
+  sentAt: documents.sentAt,
+  paidAt: documents.paidAt,
+  cancelledAt: documents.cancelledAt,
+  createdAt: documents.createdAt,
+  updatedAt: documents.updatedAt,
+};
+
+/** Documents of this business with their customer. */
+const selectDocuments = (db: TenantDb) =>
+  db.orm
+    .select(documentColumns)
+    .from(documents)
+    .innerJoin(customers, and(eq(customers.accountId, documents.accountId), eq(customers.id, documents.customerId)))
+    .$dynamic();
+
+const paymentColumns = {
+  id: payments.id,
+  invoiceId: payments.invoiceId,
+  amount: payments.amount,
+  paidAt: payments.paidAt,
+  method: payments.method,
+  reference: payments.reference,
+  note: payments.note,
+  createdAt: payments.createdAt,
+};
+
+const linkColumns = { id: documents.id, kind: documents.kind, number: documents.number };
 
 function withDisplay(row: Omit<DocumentRow, "displayStatus">, today: string): DocumentRow {
   const displayStatus =
@@ -125,33 +166,31 @@ function resolveLines(
   });
 }
 
-function writeItems(db: DB, documentId: number, lines: ReturnType<typeof resolveLines>) {
+async function writeItems(db: TenantDb, documentId: number, lines: ReturnType<typeof resolveLines>) {
   const totals = calculateDocument(lines);
-  db.prepare("DELETE FROM document_items WHERE document_id = ?").run(documentId);
-  const insert = db.prepare(
-    `INSERT INTO document_items (document_id, position, description, quantity_milli, unit_price, discount_type,
-       discount_value, tax_name, tax_rate_bps, line_total)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  lines.forEach((l, i) =>
-    insert.run(
+  await db.orm.delete(documentItems).where(and(db.owns(documentItems), idEq(documentItems.documentId, documentId)));
+  if (lines.length === 0) return totals;
+  // One multi-row insert: each round trip to a hosted database costs a few milliseconds.
+  await db.orm.insert(documentItems).values(
+    lines.map((l, i) => ({
+      accountId: db.accountId,
       documentId,
-      i,
-      l.description,
-      l.quantityMilli,
-      l.unitPrice,
-      l.discountType,
-      l.discountValue,
-      l.taxName,
-      l.taxRateBps,
-      totals.lines[i].total,
-    ),
+      position: i,
+      description: l.description,
+      quantityMilli: l.quantityMilli,
+      unitPrice: l.unitPrice,
+      discountType: l.discountType,
+      discountValue: l.discountValue,
+      taxName: l.taxName,
+      taxRateBps: l.taxRateBps,
+      lineTotal: totals.lines[i].total,
+    })),
   );
   return totals;
 }
 
-function requireActiveCustomer(db: DB, customerId: number, allowArchivedId?: number) {
-  const customer = getCustomer(db, customerId);
+async function requireActiveCustomer(db: TenantDb, customerId: number, allowArchivedId?: number) {
+  const customer = await getCustomer(db, customerId);
   if (!customer) throw new NotFoundError("Customer");
   if (customer.archivedAt && customer.id !== allowArchivedId) {
     throw new TransitionError("Archived customers cannot receive new documents");
@@ -159,137 +198,145 @@ function requireActiveCustomer(db: DB, customerId: number, allowArchivedId?: num
   return customer;
 }
 
-export function nextDocumentNumber(db: DB, kind: DocumentKind, issueDate: string): string {
-  const settings = getSettings(db);
+/** Call inside a transaction: it reads and then advances the counter in settings. */
+export async function nextDocumentNumber(db: TenantDb, kind: DocumentKind, issueDate: string): Promise<string> {
+  const settings = await getSettings(db);
   const cfg = kind === "invoice" ? settings.invoiceNumbering : settings.quotationNumbering;
-  const taken = db.prepare("SELECT 1 FROM documents WHERE kind = ? AND number = ?");
-  const { number, next } = allocateDocumentNumber(cfg, Number(issueDate.slice(0, 4)), (n) => !!taken.get(kind, n));
+  const taken = new Set(
+    (await db.orm.select({ number: documents.number }).from(documents).where(and(db.owns(documents), eq(documents.kind, kind)))).map(
+      (r) => r.number,
+    ),
+  );
+  const { number, next } = allocateDocumentNumber(cfg, Number(issueDate.slice(0, 4)), (n) => taken.has(n));
   if (kind === "invoice") settings.invoiceNumbering.next = next;
   else settings.quotationNumbering.next = next;
-  saveSettings(db, settings);
+  await saveSettings(db, settings);
   return number;
 }
 
-export function createDocument(
-  db: DB,
+export async function createDocument(
+  db: TenantDb,
   kind: DocumentKind,
   raw: unknown,
   opts: { sourceDocumentId?: number } = {},
-): DocumentDetail {
+): Promise<DocumentDetail> {
   const input = documentSchema.parse(raw);
-  return db.transaction(() => {
-    const customer = requireActiveCustomer(db, input.customerId);
-    const settings = getSettings(db);
+  return db.tx(async (db) => {
+    const customer = await requireActiveCustomer(db, input.customerId);
+    const settings = await getSettings(db);
     const lines = resolveLines(input.items, settings.taxRates);
-    const number = nextDocumentNumber(db, kind, input.issueDate);
+    const number = await nextDocumentNumber(db, kind, input.issueDate);
     const now = nowIso();
-    const res = db
-      .prepare(
-        `INSERT INTO documents (kind, number, status, customer_id, issue_date, due_date, currency, notes, terms,
-           source_document_id, created_at, updated_at)
-         VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const totals = calculateDocument(lines);
+    const [{ id }] = await db.orm
+      .insert(documents)
+      .values({
+        accountId: db.accountId,
         kind,
         number,
-        customer.id,
-        input.issueDate,
-        input.dueDate,
-        input.currency,
-        input.notes,
-        input.terms,
-        opts.sourceDocumentId ?? null,
-        now,
-        now,
-      );
-    const id = Number(res.lastInsertRowid);
-    const totals = writeItems(db, id, lines);
-    db.prepare("UPDATE documents SET subtotal=?, discount_total=?, tax_total=?, total=? WHERE id=?").run(
-      totals.subtotal,
-      totals.discountTotal,
-      totals.taxTotal,
-      totals.total,
-      id,
-    );
-    logActivity(db, {
+        status: "draft",
+        customerId: customer.id,
+        issueDate: input.issueDate,
+        dueDate: input.dueDate,
+        currency: input.currency,
+        notes: input.notes,
+        terms: input.terms,
+        sourceDocumentId: opts.sourceDocumentId ?? null,
+        subtotal: totals.subtotal,
+        discountTotal: totals.discountTotal,
+        taxTotal: totals.taxTotal,
+        total: totals.total,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning({ id: documents.id });
+    await writeItems(db, id, lines);
+    await logActivity(db, {
       type: `${kind}.created`,
       message: `${label(kind)} ${number} created for ${customer.name} (${formatMoney(totals.total, input.currency)})`,
       customerId: customer.id,
       documentId: id,
     });
-    return getDocument(db, id)!;
-  })();
+    return (await getDocument(db, id))!;
+  });
 }
 
-export function updateDocument(db: DB, id: number, raw: unknown): DocumentDetail {
+export async function updateDocument(db: TenantDb, id: number, raw: unknown): Promise<DocumentDetail> {
   const input = documentSchema.parse(raw);
-  return db.transaction(() => {
-    const doc = getDocument(db, id);
+  return db.tx(async (db) => {
+    const doc = await getDocument(db, id);
     if (!doc) throw new NotFoundError("Document");
     const editable =
       doc.kind === "invoice"
         ? isInvoiceEditable(doc.status as InvoiceStatus)
         : isQuotationEditable(doc.status as QuotationStatus);
     if (!editable) throw new TransitionError(`This ${doc.kind} can no longer be edited`);
-    const customer = requireActiveCustomer(db, input.customerId, doc.customerId);
-    const lines = resolveLines(input.items, getSettings(db).taxRates);
-    const totals = writeItems(db, id, lines);
-    db.prepare(
-      `UPDATE documents SET customer_id=?, issue_date=?, due_date=?, currency=?, notes=?, terms=?,
-         subtotal=?, discount_total=?, tax_total=?, total=?, updated_at=? WHERE id=?`,
-    ).run(
-      customer.id,
-      input.issueDate,
-      input.dueDate,
-      input.currency,
-      input.notes,
-      input.terms,
-      totals.subtotal,
-      totals.discountTotal,
-      totals.taxTotal,
-      totals.total,
-      nowIso(),
-      id,
-    );
-    logActivity(db, {
+    const customer = await requireActiveCustomer(db, input.customerId, doc.customerId);
+    const lines = resolveLines(input.items, (await getSettings(db)).taxRates);
+    const totals = await writeItems(db, id, lines);
+    await db.orm
+      .update(documents)
+      .set({
+        customerId: customer.id,
+        issueDate: input.issueDate,
+        dueDate: input.dueDate,
+        currency: input.currency,
+        notes: input.notes,
+        terms: input.terms,
+        subtotal: totals.subtotal,
+        discountTotal: totals.discountTotal,
+        taxTotal: totals.taxTotal,
+        total: totals.total,
+        updatedAt: nowIso(),
+      })
+      .where(db.byId(documents, id));
+    await logActivity(db, {
       type: `${doc.kind}.updated`,
       message: `${label(doc.kind)} ${doc.number} updated`,
       customerId: customer.id,
       documentId: id,
     });
-    return getDocument(db, id)!;
-  })();
+    return (await getDocument(db, id))!;
+  });
 }
 
-export function getDocument(db: DB, id: number, today: string = todayIso()): DocumentDetail | null {
-  const row = db.prepare(`${SELECT} WHERE d.id = ?`).get(id) as Omit<DocumentRow, "displayStatus"> | undefined;
+export async function getDocument(db: TenantDb, id: number, today: string = todayIso()): Promise<DocumentDetail | null> {
+  const [row] = await selectDocuments(db).where(db.byId(documents, id));
   if (!row) return null;
-  const items = db
-    .prepare(
-      `SELECT id, position, description, quantity_milli AS quantityMilli, unit_price AS unitPrice,
-              discount_type AS discountType, discount_value AS discountValue, tax_name AS taxName,
-              tax_rate_bps AS taxRateBps, line_total AS lineTotal
-       FROM document_items WHERE document_id = ? ORDER BY position`,
-    )
-    .all(id) as DocumentItem[];
-  const payments =
-    row.kind === "invoice"
-      ? (db
-          .prepare(
-            `SELECT id, invoice_id AS invoiceId, amount, paid_at AS paidAt, method, reference, note, created_at AS createdAt
-             FROM payments WHERE invoice_id = ? ORDER BY paid_at, id`,
-          )
-          .all(id) as Payment[])
-      : [];
-  const linked =
-    row.kind === "invoice"
-      ? row.sourceDocumentId
-        ? ((db.prepare("SELECT id, kind, number FROM documents WHERE id = ?").get(row.sourceDocumentId) as DocumentDetail["linked"]) ?? null)
-        : null
-      : ((db
-          .prepare("SELECT id, kind, number FROM documents WHERE source_document_id = ?")
-          .get(id) as DocumentDetail["linked"]) ?? null);
-  return { ...withDisplay(row, today), items, payments, linked };
+  const [items, paid, [linked]] = await db.parallel(
+    () =>
+      db.orm
+        .select({
+          id: documentItems.id,
+          position: documentItems.position,
+          description: documentItems.description,
+          quantityMilli: documentItems.quantityMilli,
+          unitPrice: documentItems.unitPrice,
+          discountType: documentItems.discountType,
+          discountValue: documentItems.discountValue,
+          taxName: documentItems.taxName,
+          taxRateBps: documentItems.taxRateBps,
+          lineTotal: documentItems.lineTotal,
+        })
+        .from(documentItems)
+        .where(and(db.owns(documentItems), eq(documentItems.documentId, id)))
+        .orderBy(asc(documentItems.position)),
+    async (): Promise<Payment[]> =>
+      row.kind !== "invoice"
+        ? []
+        : db.orm
+            .select(paymentColumns)
+            .from(payments)
+            .where(and(db.owns(payments), eq(payments.invoiceId, id)))
+            .orderBy(asc(payments.paidAt), asc(payments.id)),
+    async (): Promise<NonNullable<DocumentDetail["linked"]>[]> =>
+      row.kind === "invoice"
+        ? row.sourceDocumentId
+          ? db.orm.select(linkColumns).from(documents).where(db.byId(documents, row.sourceDocumentId))
+          : []
+        : db.orm.select(linkColumns).from(documents).where(and(db.owns(documents), eq(documents.sourceDocumentId, id))),
+  );
+  return { ...withDisplay(row, today), items, payments: paid, linked: linked ?? null };
 }
 
 export interface DocumentFilter {
@@ -298,221 +345,255 @@ export interface DocumentFilter {
   search?: string;
 }
 
-export function listDocuments(
-  db: DB,
+export async function listDocuments(
+  db: TenantDb,
   kind: DocumentKind,
   filter: DocumentFilter = {},
   today: string = todayIso(),
-): DocumentRow[] {
-  const where = ["d.kind = @kind"];
-  const params: Record<string, unknown> = { kind };
-  if (filter.customerId) {
-    where.push("d.customer_id = @customerId");
-    params.customerId = filter.customerId;
-  }
-  if (filter.search?.trim()) {
-    where.push("(d.number LIKE @q OR c.name LIKE @q OR c.company LIKE @q)");
-    params.q = `%${filter.search.trim()}%`;
-  }
+): Promise<DocumentRow[]> {
+  const q = filter.search?.trim() ? `%${filter.search.trim()}%` : null;
   const rows = (
-    db.prepare(`${SELECT} WHERE ${where.join(" AND ")} ORDER BY d.issue_date DESC, d.id DESC`).all(params) as Omit<
-      DocumentRow,
-      "displayStatus"
-    >[]
+    await selectDocuments(db)
+      .where(
+        and(
+          db.owns(documents),
+          eq(documents.kind, kind),
+          filter.customerId ? idEq(documents.customerId, filter.customerId) : undefined,
+          q ? or(ilike(documents.number, q), ilike(customers.name, q), ilike(customers.company, q)) : undefined,
+        ),
+      )
+      .orderBy(desc(documents.issueDate), desc(documents.id))
   ).map((r) => withDisplay(r, today));
   if (!filter.status || filter.status === "all") return rows;
   if (filter.status === "unpaid") return rows.filter((r) => ["sent", "partially_paid", "overdue"].includes(r.displayStatus));
   return rows.filter((r) => r.displayStatus === filter.status);
 }
 
-function requireDoc(db: DB, id: number, kind: DocumentKind): DocumentDetail {
-  const doc = getDocument(db, id);
+async function requireDoc(db: TenantDb, id: number, kind: DocumentKind): Promise<DocumentDetail> {
+  const doc = await getDocument(db, id);
   if (!doc || doc.kind !== kind) throw new NotFoundError(label(kind));
   return doc;
 }
 
 // ---------- Quotation lifecycle ----------
 
-export function setQuotationStatus(db: DB, id: number, to: QuotationStatus): DocumentDetail {
+export async function setQuotationStatus(db: TenantDb, id: number, to: QuotationStatus): Promise<DocumentDetail> {
   if (to === "converted") throw new TransitionError("Use convert to invoice instead");
-  return db.transaction(() => {
-    const q = requireDoc(db, id, "quotation");
+  return db.tx(async (db) => {
+    const q = await requireDoc(db, id, "quotation");
     assertQuotationTransition(q.status as QuotationStatus, to);
-    db.prepare(
-      `UPDATE documents SET status = ?, sent_at = COALESCE(sent_at, CASE WHEN ? = 'sent' THEN ? END), updated_at = ? WHERE id = ?`,
-    ).run(to, to, nowIso(), nowIso(), id);
-    logActivity(db, {
+    const now = nowIso();
+    await db.orm
+      .update(documents)
+      .set({ status: to, sentAt: sql`COALESCE(${documents.sentAt}, ${to === "sent" ? now : null})`, updatedAt: now })
+      .where(db.byId(documents, id));
+    await logActivity(db, {
       type: `quotation.${to}`,
       message: `Quotation ${q.number} marked ${to}`,
       customerId: q.customerId,
       documentId: id,
     });
-    return getDocument(db, id)!;
-  })();
+    return (await getDocument(db, id))!;
+  });
 }
 
 /**
  * Create a draft invoice from an accepted quotation. A partial unique index
  * guarantees a quotation can only ever produce one invoice.
  */
-export function convertQuotationToInvoice(db: DB, quotationId: number, issueDate: string): DocumentDetail {
-  return db.transaction(() => {
-    const q = requireDoc(db, quotationId, "quotation");
+export async function convertQuotationToInvoice(db: TenantDb, quotationId: number, issueDate: string): Promise<DocumentDetail> {
+  return db.tx(async (db) => {
+    const q = await requireDoc(db, quotationId, "quotation");
     if (q.status !== "accepted") throw new TransitionError("Only accepted quotations can be converted to invoices");
     if (q.linked) throw new TransitionError(`Already converted to invoice ${q.linked.number}`);
-    const settings = getSettings(db);
+    const settings = await getSettings(db);
     const dueDate = addDays(issueDate, settings.paymentTermsDays);
-    const invoice = createInsertFromItems(db, q, issueDate, dueDate, settings.invoiceTerms);
+    const invoice = await createInsertFromItems(db, q, issueDate, dueDate, settings.invoiceTerms);
     assertQuotationTransition("accepted", "converted");
-    db.prepare("UPDATE documents SET status = 'converted', updated_at = ? WHERE id = ?").run(nowIso(), quotationId);
-    logActivity(db, {
+    await db.orm.update(documents).set({ status: "converted", updatedAt: nowIso() }).where(db.byId(documents, quotationId));
+    await logActivity(db, {
       type: "quotation.converted",
       message: `Quotation ${q.number} converted to invoice ${invoice.number}`,
       customerId: q.customerId,
       documentId: quotationId,
     });
     return invoice;
-  })();
+  });
 }
 
 /** Copies quotation lines verbatim (including the tax snapshot) into a new invoice. */
-function createInsertFromItems(
-  db: DB,
+async function createInsertFromItems(
+  db: TenantDb,
   q: DocumentDetail,
   issueDate: string,
   dueDate: string,
   terms: string,
-): DocumentDetail {
-  const number = nextDocumentNumber(db, "invoice", issueDate);
+): Promise<DocumentDetail> {
+  const number = await nextDocumentNumber(db, "invoice", issueDate);
   const now = nowIso();
-  const res = db
-    .prepare(
-      `INSERT INTO documents (kind, number, status, customer_id, issue_date, due_date, currency, subtotal,
-         discount_total, tax_total, total, notes, terms, source_document_id, created_at, updated_at)
-       VALUES ('invoice', ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(number, q.customerId, issueDate, dueDate, q.currency, q.subtotal, q.discountTotal, q.taxTotal, q.total, q.notes, terms, q.id, now, now);
-  const id = Number(res.lastInsertRowid);
+  const [{ id }] = await db.orm
+    .insert(documents)
+    .values({
+      accountId: db.accountId,
+      kind: "invoice",
+      number,
+      status: "draft",
+      customerId: q.customerId,
+      issueDate,
+      dueDate,
+      currency: q.currency,
+      subtotal: q.subtotal,
+      discountTotal: q.discountTotal,
+      taxTotal: q.taxTotal,
+      total: q.total,
+      notes: q.notes,
+      terms,
+      sourceDocumentId: q.id,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning({ id: documents.id });
   const lines = q.items.map((i) => ({ ...i }));
-  const totals = writeItems(db, id, lines);
+  const totals = await writeItems(db, id, lines);
   if (totals.total !== q.total) throw new Error("Converted totals do not match the quotation");
-  logActivity(db, {
+  await logActivity(db, {
     type: "invoice.created",
     message: `Invoice ${number} created from quotation ${q.number} (${formatMoney(q.total, q.currency)})`,
     customerId: q.customerId,
     documentId: id,
   });
-  return getDocument(db, id)!;
+  return (await getDocument(db, id))!;
 }
 
 // ---------- Invoice lifecycle ----------
 
-export function markInvoiceSent(db: DB, id: number): DocumentDetail {
-  return db.transaction(() => {
-    const inv = requireDoc(db, id, "invoice");
+export async function markInvoiceSent(db: TenantDb, id: number): Promise<DocumentDetail> {
+  return db.tx(async (db) => {
+    const inv = await requireDoc(db, id, "invoice");
     if (inv.total <= 0) throw new TransitionError("An invoice must have a total greater than zero");
     assertInvoiceTransition(inv.status as InvoiceStatus, "sent");
-    db.prepare("UPDATE documents SET status='sent', sent_at=COALESCE(sent_at, ?), updated_at=? WHERE id=?").run(
-      nowIso(),
-      nowIso(),
-      id,
-    );
-    logActivity(db, { type: "invoice.sent", message: `Invoice ${inv.number} marked as sent`, customerId: inv.customerId, documentId: id });
-    return getDocument(db, id)!;
-  })();
+    const now = nowIso();
+    await db.orm
+      .update(documents)
+      .set({ status: "sent", sentAt: sql`COALESCE(${documents.sentAt}, ${now})`, updatedAt: now })
+      .where(db.byId(documents, id));
+    await logActivity(db, { type: "invoice.sent", message: `Invoice ${inv.number} marked as sent`, customerId: inv.customerId, documentId: id });
+    return (await getDocument(db, id))!;
+  });
 }
 
-export function revertInvoiceToDraft(db: DB, id: number): DocumentDetail {
-  return db.transaction(() => {
-    const inv = requireDoc(db, id, "invoice");
+export async function revertInvoiceToDraft(db: TenantDb, id: number): Promise<DocumentDetail> {
+  return db.tx(async (db) => {
+    const inv = await requireDoc(db, id, "invoice");
     assertCanRevertToDraft({ status: inv.status as InvoiceStatus, amountPaid: inv.amountPaid });
-    db.prepare("UPDATE documents SET status='draft', updated_at=? WHERE id=?").run(nowIso(), id);
-    logActivity(db, { type: "invoice.draft", message: `Invoice ${inv.number} moved back to draft`, customerId: inv.customerId, documentId: id });
-    return getDocument(db, id)!;
-  })();
+    await db.orm.update(documents).set({ status: "draft", updatedAt: nowIso() }).where(db.byId(documents, id));
+    await logActivity(db, { type: "invoice.draft", message: `Invoice ${inv.number} moved back to draft`, customerId: inv.customerId, documentId: id });
+    return (await getDocument(db, id))!;
+  });
 }
 
-export function cancelInvoice(db: DB, id: number): DocumentDetail {
-  return db.transaction(() => {
-    const inv = requireDoc(db, id, "invoice");
+export async function cancelInvoice(db: TenantDb, id: number): Promise<DocumentDetail> {
+  return db.tx(async (db) => {
+    const inv = await requireDoc(db, id, "invoice");
     assertCanCancelInvoice({ status: inv.status as InvoiceStatus, amountPaid: inv.amountPaid });
-    db.prepare("UPDATE documents SET status='cancelled', cancelled_at=?, updated_at=? WHERE id=?").run(nowIso(), nowIso(), id);
-    logActivity(db, { type: "invoice.cancelled", message: `Invoice ${inv.number} cancelled`, customerId: inv.customerId, documentId: id });
-    return getDocument(db, id)!;
-  })();
+    const now = nowIso();
+    await db.orm.update(documents).set({ status: "cancelled", cancelledAt: now, updatedAt: now }).where(db.byId(documents, id));
+    await logActivity(db, { type: "invoice.cancelled", message: `Invoice ${inv.number} cancelled`, customerId: inv.customerId, documentId: id });
+    return (await getDocument(db, id))!;
+  });
 }
 
-export function recordPayment(db: DB, invoiceId: number, raw: unknown): Payment {
+export async function recordPayment(db: TenantDb, invoiceId: number, raw: unknown): Promise<Payment> {
   const input: PaymentInput = paymentSchema.parse(raw);
-  return db.transaction(() => {
-    const inv = requireDoc(db, invoiceId, "invoice");
+  return db.tx(async (db) => {
+    const inv = await requireDoc(db, invoiceId, "invoice");
     const next = applyPayment({ status: inv.status as InvoiceStatus, total: inv.total, amountPaid: inv.amountPaid }, input.amount);
-    const res = db
-      .prepare(
-        `INSERT INTO payments (invoice_id, amount, paid_at, method, reference, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(invoiceId, input.amount, input.paidAt, input.method, input.reference, input.note, nowIso());
-    db.prepare("UPDATE documents SET amount_paid=?, status=?, paid_at=?, updated_at=? WHERE id=?").run(
-      next.amountPaid,
-      next.status,
-      next.status === "paid" ? input.paidAt : null,
-      nowIso(),
-      invoiceId,
-    );
-    logActivity(db, {
+    const [payment] = await db.orm
+      .insert(payments)
+      .values({
+        accountId: db.accountId,
+        invoiceId: inv.id,
+        amount: input.amount,
+        paidAt: input.paidAt,
+        method: input.method,
+        reference: input.reference,
+        note: input.note,
+        createdAt: nowIso(),
+      })
+      .returning(paymentColumns);
+    await db.orm
+      .update(documents)
+      .set({ amountPaid: next.amountPaid, status: next.status, paidAt: next.status === "paid" ? input.paidAt : null, updatedAt: nowIso() })
+      .where(db.byId(documents, inv.id));
+    await logActivity(db, {
       type: "payment.recorded",
       message: `Payment of ${formatMoney(input.amount, inv.currency)} received for ${inv.number}${next.status === "paid" ? " (paid in full)" : ""}`,
       customerId: inv.customerId,
       documentId: invoiceId,
     });
-    return db
-      .prepare(
-        `SELECT id, invoice_id AS invoiceId, amount, paid_at AS paidAt, method, reference, note, created_at AS createdAt FROM payments WHERE id = ?`,
-      )
-      .get(Number(res.lastInsertRowid)) as Payment;
-  })();
+    return payment;
+  });
 }
 
-export function deletePayment(db: DB, paymentId: number): DocumentDetail {
-  return db.transaction(() => {
-    const p = db.prepare("SELECT id, invoice_id AS invoiceId, amount FROM payments WHERE id = ?").get(paymentId) as
-      | { id: number; invoiceId: number; amount: number }
-      | undefined;
+export async function deletePayment(db: TenantDb, paymentId: number): Promise<DocumentDetail> {
+  return db.tx(async (db) => {
+    const [p] = await db.orm
+      .select({ id: payments.id, invoiceId: payments.invoiceId, amount: payments.amount })
+      .from(payments)
+      .where(db.byId(payments, paymentId));
     if (!p) throw new NotFoundError("Payment");
-    const inv = requireDoc(db, p.invoiceId, "invoice");
+    const inv = await requireDoc(db, p.invoiceId, "invoice");
     const next = removePayment({ status: inv.status as InvoiceStatus, total: inv.total, amountPaid: inv.amountPaid }, p.amount);
-    db.prepare("DELETE FROM payments WHERE id = ?").run(paymentId);
-    db.prepare("UPDATE documents SET amount_paid=?, status=?, paid_at=NULL, updated_at=? WHERE id=?").run(
-      next.amountPaid,
-      next.status,
-      nowIso(),
-      inv.id,
-    );
-    logActivity(db, {
+    await db.orm.delete(payments).where(db.byId(payments, p.id));
+    await db.orm
+      .update(documents)
+      .set({ amountPaid: next.amountPaid, status: next.status, paidAt: null, updatedAt: nowIso() })
+      .where(db.byId(documents, inv.id));
+    await logActivity(db, {
       type: "payment.removed",
       message: `Payment of ${formatMoney(p.amount, inv.currency)} removed from ${inv.number}`,
       customerId: inv.customerId,
       documentId: inv.id,
     });
-    return getDocument(db, inv.id)!;
-  })();
+    return (await getDocument(db, inv.id))!;
+  });
 }
 
 /** Only drafts with no payments or linked documents can be deleted. Issued documents are cancelled instead. */
-export function deleteDraftDocument(db: DB, id: number): void {
-  db.transaction(() => {
-    const doc = getDocument(db, id);
+export async function deleteDraftDocument(db: TenantDb, id: number): Promise<void> {
+  await db.tx(async (db) => {
+    const doc = await getDocument(db, id);
     if (!doc) throw new NotFoundError("Document");
     if (doc.status !== "draft") throw new TransitionError("Only drafts can be deleted");
     if (doc.linked && doc.kind === "quotation") throw new TransitionError("This quotation has an invoice");
-    db.prepare("DELETE FROM documents WHERE id = ?").run(id);
+    await db.orm.delete(documents).where(db.byId(documents, doc.id));
     if (doc.kind === "invoice" && doc.sourceDocumentId) {
       // Deleting the draft invoice re-opens the quotation it came from.
-      db.prepare("UPDATE documents SET status = 'accepted', updated_at = ? WHERE id = ? AND status = 'converted'").run(
-        nowIso(),
-        doc.sourceDocumentId,
-      );
+      await db.orm
+        .update(documents)
+        .set({ status: "accepted", updatedAt: nowIso() })
+        .where(and(db.byId(documents, doc.sourceDocumentId), eq(documents.status, "converted")));
     }
-    logActivity(db, { type: `${doc.kind}.deleted`, message: `${label(doc.kind)} draft ${doc.number} deleted`, customerId: doc.customerId });
-  })();
+    await logActivity(db, { type: `${doc.kind}.deleted`, message: `${label(doc.kind)} draft ${doc.number} deleted`, customerId: doc.customerId });
+  });
+}
+
+/** Every payment with its invoice and customer, oldest first (CSV export). */
+export async function paymentLedger(db: TenantDb) {
+  return db.orm
+    .select({
+      paidAt: payments.paidAt,
+      number: documents.number,
+      customerName: customers.name,
+      currency: documents.currency,
+      amount: payments.amount,
+      method: payments.method,
+      reference: payments.reference,
+      note: payments.note,
+    })
+    .from(payments)
+    .innerJoin(documents, and(eq(documents.accountId, payments.accountId), eq(documents.id, payments.invoiceId)))
+    .innerJoin(customers, and(eq(customers.accountId, documents.accountId), eq(customers.id, documents.customerId)))
+    .where(db.owns(payments))
+    .orderBy(asc(payments.paidAt), asc(payments.id));
 }

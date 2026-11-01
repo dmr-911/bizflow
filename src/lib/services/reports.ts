@@ -1,4 +1,6 @@
-import type { DB } from "../db";
+import { and, eq, gt, gte, inArray, lt, notInArray, sql, sum } from "drizzle-orm";
+import type { TenantDb } from "../db";
+import { activities, customers, documents, payments } from "../db/schema";
 import { daysBetween, lastMonths, todayIso } from "../dates";
 import type { Currency } from "../money";
 
@@ -11,6 +13,9 @@ function group(rows: { currency: Currency; amount: number }[]): ByCurrency {
   return out;
 }
 
+/** payments → the invoice they belong to, within the same business. */
+const invoiceOf = and(eq(documents.accountId, payments.accountId), eq(documents.id, payments.invoiceId));
+
 export interface DashboardStats {
   invoiceCount: number;
   quotationCount: number;
@@ -22,43 +27,39 @@ export interface DashboardStats {
   paidThisMonth: ByCurrency;
 }
 
-export function dashboardStats(db: DB, today = todayIso()): DashboardStats {
-  const counts = db
-    .prepare(
-      `SELECT
-         SUM(kind = 'invoice' AND status != 'cancelled') AS invoiceCount,
-         SUM(kind = 'quotation') AS quotationCount,
-         SUM(kind = 'quotation' AND status IN ('draft','sent','accepted')) AS openQuotationCount,
-         SUM(kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < @today) AS overdueCount
-       FROM documents`,
-    )
-    .get({ today }) as Record<string, number | null>;
-  const paid = db
-    .prepare(`SELECT d.currency, SUM(p.amount) AS amount FROM payments p JOIN documents d ON d.id = p.invoice_id GROUP BY d.currency`)
-    .all() as { currency: Currency; amount: number }[];
-  const paidThisMonth = db
-    .prepare(
-      `SELECT d.currency, SUM(p.amount) AS amount FROM payments p JOIN documents d ON d.id = p.invoice_id
-       WHERE substr(p.paid_at, 1, 7) = ? GROUP BY d.currency`,
-    )
-    .all(today.slice(0, 7)) as { currency: Currency; amount: number }[];
-  const outstanding = db
-    .prepare(
-      `SELECT currency, SUM(total - amount_paid) AS amount FROM documents
-       WHERE kind = 'invoice' AND status IN ('sent','partially_paid') GROUP BY currency`,
-    )
-    .all() as { currency: Currency; amount: number }[];
-  const overdue = db
-    .prepare(
-      `SELECT currency, SUM(total - amount_paid) AS amount FROM documents
-       WHERE kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < ? GROUP BY currency`,
-    )
-    .all(today) as { currency: Currency; amount: number }[];
+export async function dashboardStats(db: TenantDb, today = todayIso()): Promise<DashboardStats> {
+  const unpaid = and(db.owns(documents), eq(documents.kind, "invoice"), inArray(documents.status, ["sent", "partially_paid"]));
+  const balance = sum(sql`${documents.total} - ${documents.amountPaid}`).mapWith(Number);
+  const received = (where?: ReturnType<typeof and>) =>
+    db.orm
+      .select({ currency: documents.currency, amount: sum(payments.amount).mapWith(Number) })
+      .from(payments)
+      .innerJoin(documents, invoiceOf)
+      .where(and(db.owns(payments), where))
+      .groupBy(documents.currency);
+  const [[counts], paid, paidThisMonth, outstanding, overdue] = await db.parallel(
+    () =>
+      db.orm
+        .select({
+          invoiceCount: sql<number>`COUNT(*) FILTER (WHERE ${documents.kind} = 'invoice' AND ${documents.status} != 'cancelled')`,
+          quotationCount: sql<number>`COUNT(*) FILTER (WHERE ${documents.kind} = 'quotation')`,
+          openQuotationCount: sql<number>`COUNT(*) FILTER (WHERE ${documents.kind} = 'quotation' AND ${documents.status} IN ('draft','sent','accepted'))`,
+          overdueCount: sql<number>`COUNT(*) FILTER (WHERE ${documents.kind} = 'invoice' AND ${documents.status} IN ('sent','partially_paid') AND ${documents.dueDate} < ${today})`,
+        })
+        .from(documents)
+        .where(db.owns(documents)),
+    () => received(),
+    () => received(eq(sql`substr(${payments.paidAt}, 1, 7)`, today.slice(0, 7))),
+    () => db.orm.select({ currency: documents.currency, amount: balance }).from(documents).where(unpaid).groupBy(documents.currency),
+    () =>
+      db.orm
+        .select({ currency: documents.currency, amount: balance })
+        .from(documents)
+        .where(and(unpaid, lt(documents.dueDate, today)))
+        .groupBy(documents.currency),
+  );
   return {
-    invoiceCount: counts.invoiceCount ?? 0,
-    quotationCount: counts.quotationCount ?? 0,
-    openQuotationCount: counts.openQuotationCount ?? 0,
-    overdueCount: counts.overdueCount ?? 0,
+    ...counts,
     paid: group(paid),
     outstanding: group(outstanding),
     overdue: group(overdue),
@@ -78,24 +79,35 @@ export interface MonthRow {
  * "invoiced" is accrual basis (issued, non-cancelled invoices by issue date).
  * Months with no activity are included as zero so charts have no gaps.
  */
-export function revenueByMonth(db: DB, opts: { months?: number; currency: Currency; today?: string }): MonthRow[] {
+export async function revenueByMonth(db: TenantDb, opts: { months?: number; currency: Currency; today?: string }): Promise<MonthRow[]> {
   const today = opts.today ?? todayIso();
   const months = lastMonths(today, opts.months ?? 12);
   const from = `${months[0]}-01`;
-  const received = db
-    .prepare(
-      `SELECT substr(p.paid_at, 1, 7) AS month, SUM(p.amount) AS amount
-       FROM payments p JOIN documents d ON d.id = p.invoice_id
-       WHERE d.currency = ? AND p.paid_at >= ? GROUP BY month`,
-    )
-    .all(opts.currency, from) as { month: string; amount: number }[];
-  const invoiced = db
-    .prepare(
-      `SELECT substr(issue_date, 1, 7) AS month, SUM(total) AS amount FROM documents
-       WHERE kind = 'invoice' AND status NOT IN ('draft','cancelled') AND currency = ? AND issue_date >= ?
-       GROUP BY month`,
-    )
-    .all(opts.currency, from) as { month: string; amount: number }[];
+  const paidMonth = sql<string>`substr(${payments.paidAt}, 1, 7)`;
+  const issuedMonth = sql<string>`substr(${documents.issueDate}, 1, 7)`;
+  const [received, invoiced] = await db.parallel(
+    () =>
+      db.orm
+        .select({ month: paidMonth, amount: sum(payments.amount).mapWith(Number) })
+        .from(payments)
+        .innerJoin(documents, invoiceOf)
+        .where(and(db.owns(payments), eq(documents.currency, opts.currency), gte(payments.paidAt, from)))
+        .groupBy(paidMonth),
+    () =>
+      db.orm
+        .select({ month: issuedMonth, amount: sum(documents.total).mapWith(Number) })
+        .from(documents)
+        .where(
+          and(
+            db.owns(documents),
+            eq(documents.kind, "invoice"),
+            notInArray(documents.status, ["draft", "cancelled"]),
+            eq(documents.currency, opts.currency),
+            gte(documents.issueDate, from),
+          ),
+        )
+        .groupBy(issuedMonth),
+  );
   const r = new Map(received.map((x) => [x.month, x.amount]));
   const i = new Map(invoiced.map((x) => [x.month, x.amount]));
   return months.map((month) => ({ month, currency: opts.currency, invoiced: i.get(month) ?? 0, received: r.get(month) ?? 0 }));
@@ -115,15 +127,26 @@ export interface OutstandingRow {
 }
 
 /** Outstanding balances per customer with simple aging buckets by days past due. */
-export function outstandingBalances(db: DB, today = todayIso()): OutstandingRow[] {
-  const rows = db
-    .prepare(
-      `SELECT d.customer_id AS customerId, c.name AS customerName, d.currency, d.due_date AS dueDate,
-              d.issue_date AS issueDate, d.total - d.amount_paid AS balance
-       FROM documents d JOIN customers c ON c.id = d.customer_id
-       WHERE d.kind = 'invoice' AND d.status IN ('sent','partially_paid') AND d.total > d.amount_paid`,
-    )
-    .all() as { customerId: number; customerName: string; currency: Currency; dueDate: string | null; issueDate: string; balance: number }[];
+export async function outstandingBalances(db: TenantDb, today = todayIso()): Promise<OutstandingRow[]> {
+  const rows = await db.orm
+    .select({
+      customerId: documents.customerId,
+      customerName: customers.name,
+      currency: documents.currency,
+      dueDate: documents.dueDate,
+      issueDate: documents.issueDate,
+      balance: sql<number>`${documents.total} - ${documents.amountPaid}`,
+    })
+    .from(documents)
+    .innerJoin(customers, and(eq(customers.accountId, documents.accountId), eq(customers.id, documents.customerId)))
+    .where(
+      and(
+        db.owns(documents),
+        eq(documents.kind, "invoice"),
+        inArray(documents.status, ["sent", "partially_paid"]),
+        gt(documents.total, documents.amountPaid),
+      ),
+    );
   const map = new Map<string, OutstandingRow>();
   for (const r of rows) {
     const key = `${r.customerId}|${r.currency}`;
@@ -155,23 +178,32 @@ export interface ActiveCustomerRow {
 }
 
 /** Customers ranked by how much business happened with them in the period. */
-export function mostActiveCustomers(db: DB, opts: { since: string; limit?: number }): ActiveCustomerRow[] {
-  const rows = db
-    .prepare(
-      `SELECT c.id AS customerId, c.name AS customerName, c.company,
-         (SELECT COUNT(*) FROM documents d WHERE d.customer_id = c.id AND d.issue_date >= @since) AS documents,
-         (SELECT COUNT(*) FROM payments p JOIN documents d ON d.id = p.invoice_id
-            WHERE d.customer_id = c.id AND p.paid_at >= @since) AS payments,
-         (SELECT MAX(created_at) FROM activities a WHERE a.customer_id = c.id) AS lastActivity
-       FROM customers c`,
-    )
-    .all({ since: opts.since }) as Omit<ActiveCustomerRow, "received" | "activityCount">[];
-  const receivedRows = db
-    .prepare(
-      `SELECT d.customer_id AS customerId, d.currency, SUM(p.amount) AS amount
-       FROM payments p JOIN documents d ON d.id = p.invoice_id WHERE p.paid_at >= ? GROUP BY d.customer_id, d.currency`,
-    )
-    .all(opts.since) as { customerId: number; currency: Currency; amount: number }[];
+export async function mostActiveCustomers(db: TenantDb, opts: { since: string; limit?: number }): Promise<ActiveCustomerRow[]> {
+  // The subqueries name customers.* in full (see countDocs in customers.ts).
+  const [rows, receivedRows] = await db.parallel(
+    () =>
+      db.orm
+        .select({
+          customerId: customers.id,
+          customerName: customers.name,
+          company: customers.company,
+          documents: sql<number>`(SELECT COUNT(*) FROM ${documents} d
+            WHERE d.account_id = customers.account_id AND d.customer_id = customers.id AND d.issue_date >= ${opts.since})`,
+          payments: sql<number>`(SELECT COUNT(*) FROM ${payments} p JOIN ${documents} d ON d.account_id = p.account_id AND d.id = p.invoice_id
+            WHERE p.account_id = customers.account_id AND d.customer_id = customers.id AND p.paid_at >= ${opts.since})`,
+          lastActivity: sql<string | null>`(SELECT MAX(a.created_at) FROM ${activities} a
+            WHERE a.account_id = customers.account_id AND a.customer_id = customers.id)`,
+        })
+        .from(customers)
+        .where(db.owns(customers)),
+    () =>
+      db.orm
+        .select({ customerId: documents.customerId, currency: documents.currency, amount: sum(payments.amount).mapWith(Number) })
+        .from(payments)
+        .innerJoin(documents, invoiceOf)
+        .where(and(db.owns(payments), gte(payments.paidAt, opts.since)))
+        .groupBy(documents.customerId, documents.currency),
+  );
   return rows
     .map((r) => ({
       ...r,

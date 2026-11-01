@@ -10,7 +10,7 @@ export const metadata: Metadata = { robots: { index: false, follow: false } };
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   // Pages check the subscription themselves; billing and account pages must stay reachable when it lapses.
   const { db, settings, t, user, access } = await accountContext();
-  const r = access.allowed ? reminderCounts(db) : { overdue: 0, dueToday: 0 };
+  const r = access.allowed ? await reminderCounts(db) : { overdue: 0, dueToday: 0 };
   return (
     <I18nProvider dict={t} prefs={{ locale: settings.locale, dateFormat: settings.dateFormat }}>
       <Sidebar businessName={settings.business.name} username={user.email} reminders={r.overdue + r.dueToday} />

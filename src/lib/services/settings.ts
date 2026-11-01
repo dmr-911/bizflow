@@ -1,5 +1,7 @@
-import type { DB } from "../db";
+import { and, eq } from "drizzle-orm";
+import type { TenantDb } from "../db";
 import { nowIso } from "../db";
+import { settings as settingsTable } from "../db/schema";
 import { settingsSchema, type Settings } from "../validation";
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -30,10 +32,13 @@ export const DEFAULT_SETTINGS: Settings = {
 
 const KEY = "app";
 
-export function getSettings(db: DB): Settings {
-  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(KEY) as { value: string } | undefined;
+export async function getSettings(db: TenantDb): Promise<Settings> {
+  const [row] = await db.orm
+    .select({ value: settingsTable.value })
+    .from(settingsTable)
+    .where(and(db.owns(settingsTable), eq(settingsTable.key, KEY)));
   if (!row) return structuredClone(DEFAULT_SETTINGS);
-  const stored = JSON.parse(row.value) as Partial<Settings>;
+  const stored = row.value as Partial<Settings>;
   const merged = {
     ...DEFAULT_SETTINGS,
     ...stored,
@@ -43,19 +48,20 @@ export function getSettings(db: DB): Settings {
   return parsed.success ? parsed.data : structuredClone(DEFAULT_SETTINGS);
 }
 
-export function saveSettings(db: DB, settings: Settings): Settings {
+export async function saveSettings(db: TenantDb, settings: Settings): Promise<Settings> {
   const valid = settingsSchema.parse(settings);
   const defaults = valid.taxRates.filter((t) => t.isDefault);
   if (valid.taxRates.length > 0 && defaults.length !== 1) {
     valid.taxRates = valid.taxRates.map((t, i) => ({ ...t, isDefault: i === 0 }));
   }
-  db.prepare(
-    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).run(KEY, JSON.stringify(valid), nowIso());
+  const updatedAt = nowIso();
+  await db.orm
+    .insert(settingsTable)
+    .values({ accountId: db.accountId, key: KEY, value: valid, updatedAt })
+    .onConflictDoUpdate({ target: [settingsTable.accountId, settingsTable.key], set: { value: valid, updatedAt } });
   return valid;
 }
 
-export function updateSettings(db: DB, patch: (s: Settings) => Settings): Settings {
-  return db.transaction(() => saveSettings(db, patch(getSettings(db))))();
+export async function updateSettings(db: TenantDb, patch: (s: Settings) => Settings): Promise<Settings> {
+  return db.tx(async (db) => saveSettings(db, patch(await getSettings(db))));
 }

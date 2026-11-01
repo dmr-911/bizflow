@@ -1,12 +1,8 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import Stripe from "stripe";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeTenantDb, getTenantDb, openDatabase, withClock, type DB } from "@/lib/db";
-import { CONTROL_MIGRATIONS } from "@/lib/db/control-migrations";
+import { getDb, getTenantDb, withClock, type Db } from "@/lib/db";
 import { handleStripeEvent } from "@/lib/billing/stripe-events";
-import { createAccount } from "@/lib/services/auth";
+import { createAccount, deleteAccount } from "@/lib/services/auth";
 import {
   accessState,
   addMonthsIso,
@@ -18,35 +14,46 @@ import {
   listBillingPayments,
   setStripeCustomer,
 } from "@/lib/services/billing";
-import { createCustomer, listCustomers } from "@/lib/services/customers";
+import { createCustomer, getCustomer, listCustomers } from "@/lib/services/customers";
+import { exportBackup, restoreBackup } from "@/lib/services/data";
+import { createDocument, getDocument, listDocuments, markInvoiceSent, recordPayment } from "@/lib/services/documents";
+import { createFollowUp } from "@/lib/services/followups";
+import { dashboardStats } from "@/lib/services/reports";
+import { seedDemoData } from "@/lib/services/seed";
+import { pgFailure, useTestDatabase } from "./helpers/db";
+import { documents, followUps } from "@/lib/db/schema";
+
+useTestDatabase();
 
 const NOW = "2026-10-29T10:00:00.000Z";
 const DAY = 86_400_000;
 const plus = (iso: string, days: number) => new Date(Date.parse(iso) + days * DAY).toISOString();
 const unix = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 
-let control: DB;
+let control: Db;
 let accountId: number;
 
-beforeEach(() => {
-  control = openDatabase(":memory:", CONTROL_MIGRATIONS);
-  accountId = withClock(NOW, () =>
-    createAccount(control, { name: "Rana", businessName: "Nogor Studio", email: "rana@example.com", password: "a long password" }, { trialDays: 14 }),
+beforeEach(async () => {
+  control = await getDb();
+  accountId = (
+    await withClock(NOW, () =>
+      createAccount(control, { name: "Rana", businessName: "Nogor Studio", email: "rana@example.com", password: "a long password" }, { trialDays: 14 }),
+    )
   ).accountId;
 });
 
 describe("access rules", () => {
-  it("allows the trial, then blocks when it ends", () => {
-    const sub = getSubscription(control, accountId);
+  it("allows the trial, then blocks when it ends", async () => {
+    const sub = await getSubscription(control, accountId);
     expect(sub.trialEndsAt).toBe(plus(NOW, 14));
     expect(accessState(sub, NOW)).toMatchObject({ allowed: true, state: "trial", daysLeft: 14 });
     expect(accessState(sub, plus(NOW, 13.5))).toMatchObject({ allowed: true, daysLeft: 1 });
     expect(accessState(sub, plus(NOW, 14))).toMatchObject({ allowed: false, state: "trial_ended" });
   });
 
-  it("gives renewing subscribers a short grace period but not cancelled ones", () => {
+  it("gives renewing subscribers a short grace period but not cancelled ones", async () => {
     const end = plus(NOW, 30);
-    const active = { ...getSubscription(control, accountId), status: "active" as const, currentPeriodEnd: end };
+    const active = { ...(await getSubscription(control, accountId)), status: "active" as const, currentPeriodEnd: end };
     expect(accessState(active, plus(NOW, 29)).state).toBe("active");
     expect(accessState(active, plus(NOW, 31))).toMatchObject({ allowed: true, state: "grace" });
     expect(accessState(active, plus(NOW, 34))).toMatchObject({ allowed: false, state: "expired" });
@@ -61,35 +68,35 @@ describe("access rules", () => {
 });
 
 describe("bKash payments", () => {
-  it("adds a month after the remaining trial, once per payment", () => {
-    withClock(plus(NOW, 4), () => {
-      createPendingBkashPayment(control, accountId, "TR0001", 60000);
-      const first = completeBkashPayment(control, "TR0001", "BKX1");
+  it("adds a month after the remaining trial, once per payment", async () => {
+    await withClock(plus(NOW, 4), async () => {
+      await createPendingBkashPayment(control, accountId, "TR0001", 60000);
+      const first = await completeBkashPayment(control, "TR0001", "BKX1");
       // 10 trial days were left, so paying early does not cost the customer those days.
       expect(first).toEqual({ extended: true, periodEnd: addMonthsIso(plus(NOW, 14), 1) });
-      expect(completeBkashPayment(control, "TR0001", "BKX1").extended).toBe(false);
+      expect((await completeBkashPayment(control, "TR0001", "BKX1")).extended).toBe(false);
     });
-    const sub = getSubscription(control, accountId);
+    const sub = await getSubscription(control, accountId);
     expect(sub).toMatchObject({ status: "active", provider: "bkash", currentPeriodEnd: addMonthsIso(plus(NOW, 14), 1) });
-    expect(listBillingPayments(control, accountId)).toMatchObject([{ provider: "bkash", trxId: "BKX1", amount: 60000, currency: "BDT", status: "paid" }]);
+    expect(await listBillingPayments(control, accountId)).toMatchObject([{ provider: "bkash", trxId: "BKX1", amount: 60000, currency: "BDT", status: "paid" }]);
   });
 
-  it("stacks months and restarts from today after a lapse", () => {
-    withClock(plus(NOW, 20), () => {
-      createPendingBkashPayment(control, accountId, "P1", 60000);
-      createPendingBkashPayment(control, accountId, "P2", 60000);
-      completeBkashPayment(control, "P1", "T1");
-      completeBkashPayment(control, "P2", "T2");
+  it("stacks months and restarts from today after a lapse", async () => {
+    await withClock(plus(NOW, 20), async () => {
+      await createPendingBkashPayment(control, accountId, "P1", 60000);
+      await createPendingBkashPayment(control, accountId, "P2", 60000);
+      await completeBkashPayment(control, "P1", "T1");
+      await completeBkashPayment(control, "P2", "T2");
     });
-    expect(getSubscription(control, accountId).currentPeriodEnd).toBe(addMonthsIso(addMonthsIso(plus(NOW, 20), 1), 1));
+    expect((await getSubscription(control, accountId)).currentPeriodEnd).toBe(addMonthsIso(addMonthsIso(plus(NOW, 20), 1), 1));
   });
 
-  it("records cancelled payments without granting access", () => {
-    createPendingBkashPayment(control, accountId, "P3", 60000);
-    failBkashPayment(control, "P3", "cancelled");
-    expect(() => completeBkashPayment(control, "nope", "T")).toThrow();
-    expect(getSubscription(control, accountId).currentPeriodEnd).toBeNull();
-    expect(listBillingPayments(control, accountId)[0].status).toBe("cancelled");
+  it("records cancelled payments without granting access", async () => {
+    await createPendingBkashPayment(control, accountId, "P3", 60000);
+    await failBkashPayment(control, "P3", "cancelled");
+    await expect(completeBkashPayment(control, "nope", "T")).rejects.toThrow();
+    expect((await getSubscription(control, accountId)).currentPeriodEnd).toBeNull();
+    expect((await listBillingPayments(control, accountId))[0].status).toBe("cancelled");
   });
 });
 
@@ -120,7 +127,7 @@ describe("Stripe events", () => {
       event("checkout.session.completed", { client_reference_id: String(accountId), customer: "cus_123", subscription: "sub_123" }),
       fetchSub,
     );
-    let sub = getSubscription(control, accountId);
+    let sub = await getSubscription(control, accountId);
     expect(sub).toMatchObject({ status: "active", provider: "stripe", stripeCustomerId: "cus_123", stripeSubscriptionId: "sub_123", currentPeriodEnd: plus(NOW, 30) });
 
     remote = fakeSubscription({ periodEnd: plus(NOW, 61) });
@@ -137,68 +144,134 @@ describe("Stripe events", () => {
       }),
       fetchSub,
     );
-    expect(getSubscription(control, accountId).currentPeriodEnd).toBe(plus(NOW, 61));
-    expect(listBillingPayments(control, accountId)).toMatchObject([{ provider: "stripe", reference: "in_2", amount: 500, currency: "USD", status: "paid" }]);
+    expect((await getSubscription(control, accountId)).currentPeriodEnd).toBe(plus(NOW, 61));
+    expect(await listBillingPayments(control, accountId)).toMatchObject([{ provider: "stripe", reference: "in_2", amount: 500, currency: "USD", status: "paid" }]);
 
     await handleStripeEvent(control, event("customer.subscription.deleted", fakeSubscription({ status: "canceled", periodEnd: plus(NOW, 61) })), fetchSub);
-    sub = getSubscription(control, accountId);
+    sub = await getSubscription(control, accountId);
     expect(sub).toMatchObject({ status: "canceled", stripeSubscriptionId: null, currentPeriodEnd: plus(NOW, 61) });
     expect(accessState(sub, plus(NOW, 60)).allowed).toBe(true);
     expect(accessState(sub, plus(NOW, 62)).allowed).toBe(false);
   });
 
   it("finds the account by customer id and never shortens paid time", async () => {
-    setStripeCustomer(control, accountId, "cus_123");
+    await setStripeCustomer(control, accountId, "cus_123");
     const late = fakeSubscription({ periodEnd: plus(NOW, 30), metadata: {} });
     await handleStripeEvent(control, event("customer.subscription.updated", late), async () => late);
     // An older event arriving late must not move the date backwards.
     const older = fakeSubscription({ periodEnd: plus(NOW, 2), metadata: {} });
     await handleStripeEvent(control, event("customer.subscription.updated", older), async () => older);
-    expect(getSubscription(control, accountId).currentPeriodEnd).toBe(plus(NOW, 30));
+    expect((await getSubscription(control, accountId)).currentPeriodEnd).toBe(plus(NOW, 30));
   });
 
   it("marks past_due and ignores incomplete checkouts", async () => {
     const incomplete = fakeSubscription({ status: "incomplete", periodEnd: plus(NOW, 30) });
     await handleStripeEvent(control, event("customer.subscription.created", incomplete), async () => incomplete);
-    expect(getSubscription(control, accountId).status).toBe("trialing");
+    expect((await getSubscription(control, accountId)).status).toBe("trialing");
     const pastDue = fakeSubscription({ status: "past_due", periodEnd: plus(NOW, 30) });
     await handleStripeEvent(control, event("customer.subscription.updated", pastDue), async () => pastDue);
-    expect(getSubscription(control, accountId).status).toBe("past_due");
+    expect((await getSubscription(control, accountId)).status).toBe("past_due");
   });
 
-  it("verifies webhook signatures and deduplicates retries", () => {
+  it("verifies webhook signatures and deduplicates retries", async () => {
     const stripe = new Stripe("sk_test_dummy");
     const secret = "whsec_test";
     const payload = JSON.stringify({ id: "evt_1", object: "event", type: "invoice.paid", data: { object: {} } });
     const header = stripe.webhooks.generateTestHeaderString({ payload, secret });
     expect(stripe.webhooks.constructEvent(payload, header, secret).id).toBe("evt_1");
     expect(() => stripe.webhooks.constructEvent(payload.replace("evt_1", "evt_2"), header, secret)).toThrow();
-    expect(claimWebhookEvent(control, "stripe", "evt_1")).toBe(true);
-    expect(claimWebhookEvent(control, "stripe", "evt_1")).toBe(false);
+    expect(await claimWebhookEvent(control, "stripe", "evt_1")).toBe(true);
+    expect(await claimWebhookEvent(control, "stripe", "evt_1")).toBe(false);
   });
 });
 
 describe("tenant isolation", () => {
-  let dir: string;
-  const prev = process.env.DATA_DIR;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bizflow-test-"));
-    process.env.DATA_DIR = dir;
-  });
-  afterEach(() => {
-    closeTenantDb(1);
-    closeTenantDb(2);
-    process.env.DATA_DIR = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
+  const blank = { company: "", email: "", phone: "", address: "", city: "", country: "", taxId: "", notes: "" };
+  const items = [{ description: "Work", quantity: "1", unitPrice: "100", discountType: "percent", discountValue: "0", taxRateId: "none" }];
+  const docInput = (customerId: number) => ({ customerId, issueDate: "2026-10-01", dueDate: "2026-10-15", currency: "BDT", notes: "", terms: "", items });
+  let otherId: number;
+  beforeEach(async () => {
+    otherId = (await createAccount(control, { name: "B", businessName: "Other", email: "b@example.com", password: "a long password" }, { trialDays: 14 }))
+      .accountId;
   });
 
-  it("keeps each business in its own database file", () => {
-    const customer = { company: "", email: "", phone: "", address: "", city: "", country: "", taxId: "", notes: "" };
-    createCustomer(getTenantDb(1), { ...customer, name: "Only in business one" });
-    createCustomer(getTenantDb(2), { ...customer, name: "Only in business two" });
-    expect(listCustomers(getTenantDb(1)).map((c) => c.name)).toEqual(["Only in business one"]);
-    expect(listCustomers(getTenantDb(2)).map((c) => c.name)).toEqual(["Only in business two"]);
-    expect(fs.readdirSync(path.join(dir, "tenants")).filter((f) => f.endsWith(".db")).sort()).toEqual(["1.db", "2.db"]);
+  it("keeps each business's records apart in the shared database", async () => {
+    const one = await getTenantDb(accountId);
+    const two = await getTenantDb(otherId);
+    const c1 = await createCustomer(one, { ...blank, name: "Only in business one" });
+    const c2 = await createCustomer(two, { ...blank, name: "Only in business two" });
+    expect((await listCustomers(one)).map((c) => c.name)).toEqual(["Only in business one"]);
+    expect((await listCustomers(two)).map((c) => c.name)).toEqual(["Only in business two"]);
+    // Guessing another business's id finds nothing.
+    expect(await getCustomer(one, c2.id)).toBeNull();
+    const inv = await createDocument(two, "invoice", docInput(c2.id));
+    expect(await getDocument(one, inv.id)).toBeNull();
+    await expect(markInvoiceSent(one, inv.id)).rejects.toThrow(/not found/);
+    // Document numbers are per business: both start at 0001.
+    expect((await createDocument(one, "invoice", docInput(c1.id))).number).toBe(inv.number);
+  });
+
+  it("refuses links to another business's records, even through raw SQL", async () => {
+    const one = await getTenantDb(accountId);
+    const two = await getTenantDb(otherId);
+    const theirs = await createCustomer(two, { ...blank, name: "Theirs" });
+    await expect(createDocument(one, "invoice", docInput(theirs.id))).rejects.toThrow(/Customer not found/);
+    await expect(createFollowUp(one, { title: "Call", dueDate: "2026-11-01", customerId: theirs.id })).rejects.toThrow(/not found/);
+    // The composite foreign key is the last line of defence.
+    expect(
+      await pgFailure(
+        one.orm.insert(followUps).values({ accountId: one.accountId, title: "x", dueDate: "2026-11-01", customerId: theirs.id, createdAt: "now" }),
+      ),
+    ).toMatch(/foreign key/);
+  });
+
+  it("restores a backup into another business without touching the first", async () => {
+    const one = await getTenantDb(accountId);
+    const two = await getTenantDb(otherId);
+    await seedDemoData(one, "2026-10-29");
+    const before = await dashboardStats(one, "2026-10-29");
+    await restoreBackup(two, JSON.parse(JSON.stringify(await exportBackup(one))));
+    expect(await dashboardStats(two, "2026-10-29")).toEqual(before);
+    expect(await dashboardStats(one, "2026-10-29")).toEqual(before);
+    // Same ids live side by side, and new rows still get fresh ids afterwards.
+    const c = await createCustomer(two, { ...blank, name: "New after restore" });
+    expect((await listCustomers(two, { includeArchived: true })).filter((x) => x.id === c.id)).toHaveLength(1);
+  });
+
+  it("deleting an account removes all of its business records and nothing else", async () => {
+    const one = await getTenantDb(accountId);
+    const two = await getTenantDb(otherId);
+    await seedDemoData(one, "2026-10-29");
+    await seedDemoData(two, "2026-10-29");
+    await deleteAccount(control, accountId);
+    const left = await control.orm.selectDistinct({ accountId: documents.accountId }).from(documents);
+    expect(left).toEqual([{ accountId: otherId }]);
+    expect((await listDocuments(two, "invoice")).length).toBeGreaterThan(0);
+  });
+
+  it("hands out unique document numbers when requests arrive at the same time", async () => {
+    const one = await getTenantDb(accountId);
+    const c = await createCustomer(one, { ...blank, name: "Busy" });
+    const docs = await Promise.all(Array.from({ length: 8 }, () => createDocument(one, "invoice", docInput(c.id))));
+    expect(new Set(docs.map((d) => d.number)).size).toBe(8);
+  });
+
+  it("treats ids that are not numbers as not found", async () => {
+    const one = await getTenantDb(accountId);
+    expect(await getCustomer(one, Number("abc"))).toBeNull();
+    expect(await getDocument(one, NaN)).toBeNull();
+  });
+
+  it("pays an invoice twice in parallel without losing either payment", async () => {
+    const one = await getTenantDb(accountId);
+    const c = await createCustomer(one, { ...blank, name: "Payer" });
+    const inv = await createDocument(one, "invoice", docInput(c.id));
+    await markInvoiceSent(one, inv.id);
+    await Promise.all([
+      recordPayment(one, inv.id, { amount: "30", paidAt: "2026-10-02", method: "cash" }),
+      recordPayment(one, inv.id, { amount: "40", paidAt: "2026-10-02", method: "cash" }),
+    ]);
+    expect((await getDocument(one, inv.id))!.amountPaid).toBe(7000);
   });
 });
 
@@ -237,11 +310,11 @@ describe("bKash client", () => {
 
 describe("Stripe events for unknown subscriptions", () => {
   it("ignores the cancellation of a subscription the account does not have", async () => {
-    createPendingBkashPayment(control, accountId, "P9", 60000);
-    completeBkashPayment(control, "P9", "T9");
-    const before = getSubscription(control, accountId);
+    await createPendingBkashPayment(control, accountId, "P9", 60000);
+    await completeBkashPayment(control, "P9", "T9");
+    const before = await getSubscription(control, accountId);
     const stray = fakeSubscription({ id: "sub_other", status: "canceled", periodEnd: plus(NOW, 5) });
     await handleStripeEvent(control, event("customer.subscription.deleted", stray), async () => stray);
-    expect(getSubscription(control, accountId)).toEqual(before);
+    expect(await getSubscription(control, accountId)).toEqual(before);
   });
 });
