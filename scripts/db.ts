@@ -34,7 +34,7 @@ async function main() {
   }
   const db = await getDb();
   const accountFor = async (email: string | undefined) => {
-    if (!email) throw new Error("Give the account owner's email address");
+    if (!email) throw new Error(`Usage: npm run db:${cmd} <owner-email>${cmd === "grant" ? " <days>" : ""}  (the email you signed up with; npm run db:accounts lists them)`);
     const userId = await findUserIdByEmail(db, email);
     if (!userId) throw new Error(`No user with email ${email}`);
     const [{ accountId }] = await db.orm.select({ accountId: users.accountId }).from(users).where(eq(users.id, userId));
