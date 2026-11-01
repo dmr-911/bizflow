@@ -13,13 +13,17 @@ import { todayIso } from "@/lib/dates";
 export default async function CustomerPage({ params }: { params: Promise<{ id: string }> }) {
   const { db, t, fmt, settings } = await pageContext();
   const id = Number((await params).id);
-  const c = Number.isInteger(id) ? getCustomer(db, id) : null;
+  const c = Number.isSafeInteger(id) ? await getCustomer(db, id) : null;
   if (!c) notFound();
-  const quotations = listDocuments(db, "quotation", { customerId: id });
-  const invoices = listDocuments(db, "invoice", { customerId: id });
-  const followUps = listFollowUps(db, { customerId: id });
-  const activity = recentActivity(db, { customerId: id, limit: 10 });
-  const balance = customerBalances(db, id).get(id) ?? {};
+  const [quotations, invoices, followUps, activity, balances, options] = await Promise.all([
+    listDocuments(db, "quotation", { customerId: id }),
+    listDocuments(db, "invoice", { customerId: id }),
+    listFollowUps(db, { customerId: id }),
+    recentActivity(db, { customerId: id, limit: 10 }),
+    customerBalances(db, id),
+    customerOptions(db, id),
+  ]);
+  const balance = balances.get(id) ?? {};
   const paid: Partial<Record<"BDT" | "USD", number>> = {};
   for (const i of invoices) paid[i.currency] = (paid[i.currency] ?? 0) + i.amountPaid;
 
@@ -88,7 +92,7 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
             <Card title={t.followUps.title} padded={false}>
               <FollowUpList items={followUps} t={t} fmt={fmt} />
               <div className="border-t border-slate-100 p-4">
-                <FollowUpForm customers={customerOptions(db, c.id)} defaultCustomerId={c.id} defaultDate={todayIso()} compact />
+                <FollowUpForm customers={options} defaultCustomerId={c.id} defaultDate={todayIso()} compact />
               </div>
             </Card>
             <Card title={t.customers.activity} padded={false}>

@@ -1,5 +1,5 @@
 import type Stripe from "stripe";
-import { getControlDb } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { stripeClient } from "@/lib/billing/stripe";
 import { handleStripeEvent } from "@/lib/billing/stripe-events";
 import { claimWebhookEvent, releaseWebhookEvent } from "@/lib/services/billing";
@@ -19,13 +19,13 @@ export async function POST(req: Request) {
     return new Response("Invalid signature", { status: 400 });
   }
 
-  const db = getControlDb();
-  if (!claimWebhookEvent(db, "stripe", event.id)) return Response.json({ received: true, duplicate: true });
+  const db = await getDb();
+  if (!(await claimWebhookEvent(db, "stripe", event.id))) return Response.json({ received: true, duplicate: true });
   try {
     await handleStripeEvent(db, event, (id) => stripe.subscriptions.retrieve(id));
   } catch (e) {
     // Let Stripe retry later.
-    releaseWebhookEvent(db, "stripe", event.id);
+    await releaseWebhookEvent(db, "stripe", event.id);
     console.error("Stripe webhook failed", event.type, event.id, e);
     return new Response("Webhook handler failed", { status: 500 });
   }

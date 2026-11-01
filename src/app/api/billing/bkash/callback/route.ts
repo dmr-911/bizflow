@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getControlDb } from "@/lib/db";
+import { getDb } from "@/lib/db";
 import { bkashConfig, executePayment, queryPayment, type BkashPaymentResult } from "@/lib/billing/bkash";
 import { completeBkashPayment, failBkashPayment, pendingBkashPayment } from "@/lib/services/billing";
 import { routeUser } from "@/lib/server/route-auth";
@@ -11,8 +11,8 @@ export async function GET(req: NextRequest) {
   const back = (result: string) => NextResponse.redirect(new URL(`/billing?bkash=${result}`, process.env.APP_URL || req.url));
   const paymentId = req.nextUrl.searchParams.get("paymentID") ?? "";
   const status = req.nextUrl.searchParams.get("status");
-  const db = getControlDb();
-  const pending = paymentId ? pendingBkashPayment(db, paymentId) : null;
+  const db = await getDb();
+  const pending = paymentId ? await pendingBkashPayment(db, paymentId) : null;
   if (!pending) return back("failed");
 
   // If someone is signed in, it must be the account that started the payment.
@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
   if (pending.status !== "pending") return back("failed");
 
   if (status !== "success") {
-    failBkashPayment(db, paymentId, status === "cancel" ? "cancelled" : "failed");
+    await failBkashPayment(db, paymentId, status === "cancel" ? "cancelled" : "failed");
     return back(status === "cancel" ? "cancelled" : "failed");
   }
 
@@ -43,9 +43,9 @@ export async function GET(req: NextRequest) {
   }
 
   if (result.completed && result.amount >= pending.amount) {
-    completeBkashPayment(db, paymentId, result.trxId);
+    await completeBkashPayment(db, paymentId, result.trxId);
     return back("success");
   }
-  failBkashPayment(db, paymentId, "failed");
+  await failBkashPayment(db, paymentId, "failed");
   return back("failed");
 }

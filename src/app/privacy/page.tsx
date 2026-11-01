@@ -15,7 +15,7 @@ export default function PrivacyPage() {
       <h2>What we collect</h2>
       <ul>
         <li><strong>Account details:</strong> your name, business name, email address and a securely hashed password (we never store the password itself).</li>
-        <li><strong>Business data you enter:</strong> customers, quotations, invoices, payments, follow-ups and settings. Each business is stored in its own separate database.</li>
+        <li><strong>Business data you enter:</strong> customers, quotations, invoices, payments, follow-ups and settings. Every record is tied to your business account and is never shown to another account.</li>
         <li><strong>Billing records:</strong> your plan, payment dates, amounts and payment references. Card numbers are handled by Stripe and bKash PINs by bKash; they never reach our servers.</li>
         <li><strong>Technical data:</strong> IP address and browser information in server logs, used for security and troubleshooting, and essential cookies (below).</li>
       </ul>
@@ -30,7 +30,7 @@ export default function PrivacyPage() {
       <h2>Who we share it with</h2>
       <ul>
         <li><strong>Stripe</strong> (card payments) and <strong>bKash</strong> (mobile payments), only the details needed to take a payment.</li>
-        <li>Our hosting and email providers, who process data on our behalf under confidentiality obligations.</li>
+        <li>Our hosting, database and email providers, who process data on our behalf under confidentiality obligations.</li>
         <li>Authorities, only where the law requires it.</li>
       </ul>
 
@@ -41,7 +41,7 @@ export default function PrivacyPage() {
 
       <h2>Retention and deletion</h2>
       <p>
-        We keep your data while your account exists. When you delete your account from the Billing page, your business database and login are removed immediately from our
+        We keep your data while your account exists. When you delete your account from the Billing page, your business records and login are removed immediately from our
         live systems; backups are overwritten within 30 days. We may keep billing records longer where accounting law requires it.
       </p>
 
@@ -51,7 +51,7 @@ export default function PrivacyPage() {
       </p>
 
       <h2>Security</h2>
-      <p>Connections are encrypted with HTTPS, passwords are hashed with scrypt, and every business&apos;s records are kept in a separate database.</p>
+      <p>Connections are encrypted with HTTPS, passwords are hashed with scrypt, data is encrypted at rest by our database provider, and every query is limited to the signed-in business&apos;s own records.</p>
 
       <h2>Changes</h2>
       <p>We will post any changes here and email you about significant ones.</p>
